@@ -199,16 +199,37 @@ void buildHomeScreen(lv_obj_t *scr) {
 // increment/decrement pulses we send are fire-and-forget with no readback.
 // Good enough until the companion app can report the real value over serial.
 constexpr int VOLUME_STEP = 2;
-constexpr uint32_t VOLUME_RETURN_MS = 5000; // matches the 5s fuse from the design doc
+// Shared by Volume and Speaker Mute — both are transient, globally-triggered
+// overlays (rotate / knob-press) that restore whatever they interrupted
+// after this long. Renamed from VOLUME_RETURN_MS (2026-08-06) once Speaker
+// Mute started using the same fuse.
+constexpr uint32_t OVERLAY_RETURN_MS = 5000;
 int volumePercent = 50;
 uint32_t lastVolumeActivityMs = 0;
+
+// Volume level icons (src/img_volume_waves.c) — real FontAwesome 5 pixels,
+// same style as LV_SYMBOL_VOLUME_MID/MAX (confirmed perfect on the Speaker
+// Mute screen, since those render as pre-baked bitmap glyphs rather than a
+// live lv_arc widget — the actual root cause of the tearing on every earlier
+// attempt here was lv_arc specifically, not curved shapes in general). Only
+// wave2 (the 2-wave middle tier) needed synthesizing — FA5 doesn't ship one —
+// done by pixel-diffing the 1-wave and 3-wave glyphs to isolate just the
+// middle wave arc and compositing it onto the 1-wave glyph, so it's real
+// font pixels throughout, not a hand-drawn approximation. Two earlier
+// attempts at this (small lv_arc wave marks, then a rectangle-built
+// speaker+bars composite) are superseded by this — see PROGRESS.md for the
+// full story of how this converged.
+extern const lv_image_dsc_t img_volume_wave1; // 1 wave (low)
+extern const lv_image_dsc_t img_volume_wave2; // 2 waves (medium)
+extern const lv_image_dsc_t img_volume_wave3; // 3 waves (high)
 
 lv_obj_t *homeScreen;
 lv_obj_t *volumeScreen;
 lv_obj_t *volumeArc;
-lv_obj_t *volumeIcon;
+lv_obj_t *volumeMuteIcon; // LV_SYMBOL_MUTE label, shown only at 0%
+lv_obj_t *volumeWaveIcon; // single image widget, src swapped per tier
 lv_obj_t *volumeLabel;
-lv_obj_t *previousScreen; // whatever was showing before Volume interrupted it
+lv_obj_t *previousScreen; // whatever was showing before Volume/Speaker Mute interrupted it
 
 // Same blue used for the ring, the "VOLUME" caption, and the icon — matches
 // the original UI mockup (https://claude.ai/code/artifact/659dd01a-d6ab-42d9-
@@ -220,15 +241,20 @@ constexpr uint32_t VOLUME_ACCENT_COLOR = 0x0080FF;
 void updateVolumeScreen() {
   lv_arc_set_value(volumeArc, volumePercent);
   lv_label_set_text_fmt(volumeLabel, "%d", volumePercent); // no "%" — matches mockup's bare number
-  // Mirrors a real OSD: icon reflects level, not just a static speaker glyph
-  // (the mockup uses one fixed icon — this is a deliberate small improvement
-  // on it, not a fidelity gap).
+
+  // Show/hide + src swap only — no lv_obj_align() calls here, position is
+  // fixed at build time (see PROGRESS.md: realigning on every update was the
+  // suspected cause of the very first icon attempt's tearing).
   if (volumePercent == 0) {
-    lv_label_set_text(volumeIcon, LV_SYMBOL_MUTE);
-  } else if (volumePercent < 50) {
-    lv_label_set_text(volumeIcon, LV_SYMBOL_VOLUME_MID);
+    lv_obj_remove_flag(volumeMuteIcon, LV_OBJ_FLAG_HIDDEN);
+    lv_obj_add_flag(volumeWaveIcon, LV_OBJ_FLAG_HIDDEN);
   } else {
-    lv_label_set_text(volumeIcon, LV_SYMBOL_VOLUME_MAX);
+    lv_obj_add_flag(volumeMuteIcon, LV_OBJ_FLAG_HIDDEN);
+    lv_obj_remove_flag(volumeWaveIcon, LV_OBJ_FLAG_HIDDEN);
+    const lv_image_dsc_t *src = volumePercent > 66  ? &img_volume_wave3
+                                 : volumePercent > 33 ? &img_volume_wave2
+                                                       : &img_volume_wave1;
+    lv_image_set_src(volumeWaveIcon, src);
   }
 }
 
@@ -257,13 +283,25 @@ void buildVolumeScreen(lv_obj_t *scr) {
   lv_obj_align(caption, LV_ALIGN_CENTER, 0, -95);
 
   // Icon, number, and device name form one tight centered cluster (matches
-  // the mockup's `.dial-content` flex column) — icon takes the accent color
-  // like the caption, number is the only white element, device name is
-  // small/muted right below it.
-  volumeIcon = lv_label_create(scr);
-  lv_obj_set_style_text_font(volumeIcon, &lv_font_montserrat_42, 0);
-  lv_obj_set_style_text_color(volumeIcon, lv_color_hex(VOLUME_ACCENT_COLOR), 0);
-  lv_obj_align(volumeIcon, LV_ALIGN_CENTER, 0, -50);
+  // the mockup's `.dial-content` flex column) — icon/waves take the accent
+  // color like the caption, number is the only white element, device name is
+  // small/muted right below it. Both icon states are built once at a fixed
+  // position; updateVolumeScreen() only ever toggles which is hidden.
+  volumeMuteIcon = lv_label_create(scr);
+  lv_obj_set_style_text_font(volumeMuteIcon, &lv_font_montserrat_42, 0);
+  lv_obj_set_style_text_color(volumeMuteIcon, lv_color_hex(VOLUME_ACCENT_COLOR), 0);
+  lv_label_set_text(volumeMuteIcon, LV_SYMBOL_MUTE);
+  lv_obj_align(volumeMuteIcon, LV_ALIGN_CENTER, 0, -50);
+
+  // Single image widget, src swapped per tier in updateVolumeScreen() —
+  // matches the size/style of Speaker Mute's LV_SYMBOL_VOLUME_MAX icon
+  // (Brian: "make it match the size and shape of the one on the mute
+  // screen"), since these are literally built from the same source font.
+  volumeWaveIcon = lv_image_create(scr);
+  lv_image_set_src(volumeWaveIcon, &img_volume_wave3);
+  lv_obj_set_style_image_recolor(volumeWaveIcon, lv_color_hex(VOLUME_ACCENT_COLOR), 0);
+  lv_obj_set_style_image_recolor_opa(volumeWaveIcon, LV_OPA_COVER, 0);
+  lv_obj_align(volumeWaveIcon, LV_ALIGN_CENTER, 0, -50);
 
   volumeLabel = lv_label_create(scr);
   lv_obj_set_style_text_font(volumeLabel, &lv_font_montserrat_64_custom, 0);
@@ -299,6 +337,115 @@ void showVolumeOverlay(int delta) {
   volumePercent = constrain(volumePercent + delta, 0, 100);
   updateVolumeScreen();
   lastVolumeActivityMs = millis();
+}
+
+// Speaker Mute screen: originally scoped from the mockup's "Mic Mute" card,
+// but retargeted (2026-08-06, Brian caught mid-build that the mockup's mic
+// icon meant *microphone* mute, not speaker) — there's no broadly-recognized
+// HID usage for muting a mic the way CONSUMER_CONTROL_MUTE (0x00E2) already
+// reliably mutes the default *output* device (confirmed working on a real
+// desktop earlier this project), so retargeting this screen to speaker mute
+// makes it immediately, reliably functional over pure HID, same as Volume.
+// Real mic mute is left as an open question — see PROGRESS.md.
+// Triggered by the knob's physical push-button, globally, mirroring how
+// rotate globally triggers Volume — not by a touchscreen tap on this screen
+// (the mockup's original "Click: Toggle mute" assumed touch-based per-screen
+// navigation reaching this screen first, which no longer applies now that
+// it's reached the same way Volume is, via a global hardware input).
+constexpr uint32_t SPEAKER_MUTE_ACCENT_COLOR = 0xF0555F; // same red as the mockup's Mic card
+bool speakerMuted = false; // local estimate only — HID mute is a toggle with no readback
+uint32_t lastSpeakerMuteActivityMs = 0;
+
+// Speaker-muted icon (src/img_speaker_muted.c) — the same FA5 "volume-mute"
+// cone as LV_SYMBOL_MUTE, but with a diagonal slash baked directly into the
+// bitmap (cut into the alpha mask as transparent pixels, not drawn as extra
+// opaque ones — same-alpha-as-cone is invisible in a single-color A8 image).
+// Replaces an earlier label+lv_line combo: LV_SYMBOL_MUTE alone rendered as
+// a bare speaker with no visible X/slash (confirmed on hardware — "shows no
+// lines... but should have a slash"), and positioning a separate line
+// widget to track the label's own runtime-computed layout box took several
+// rounds of guessing and still didn't land right. Baking both into one
+// bitmap sidesteps the whole alignment problem — rendered and previewed
+// locally (Python/Pillow) before ever touching the device, same as the
+// wave-tier icons.
+extern const lv_image_dsc_t img_speaker_muted;
+
+lv_obj_t *speakerMuteScreen;
+lv_obj_t *speakerMuteArc;
+lv_obj_t *speakerMuteIcon;     // img_speaker_muted, shown only when muted
+lv_obj_t *speakerMuteWaveIcon; // same img_volume_wave1/2/3 as Volume, shown when not muted
+lv_obj_t *speakerMuteLabel;
+
+void updateSpeakerMuteScreen() {
+  lv_arc_set_value(speakerMuteArc, speakerMuted ? 100 : 0);
+  lv_label_set_text(speakerMuteLabel, speakerMuted ? "MUTED" : "LIVE");
+  if (speakerMuted) {
+    lv_obj_remove_flag(speakerMuteIcon, LV_OBJ_FLAG_HIDDEN);
+    lv_obj_add_flag(speakerMuteWaveIcon, LV_OBJ_FLAG_HIDDEN);
+  } else {
+    lv_obj_add_flag(speakerMuteIcon, LV_OBJ_FLAG_HIDDEN);
+    lv_obj_remove_flag(speakerMuteWaveIcon, LV_OBJ_FLAG_HIDDEN);
+    // Same tier count as the Volume screen (Brian: "let the number of
+    // speaker arcs correspond with the number of speaker arcs on the volume
+    // page") — both read from the same shared `volumePercent`.
+    const lv_image_dsc_t *src = volumePercent > 66  ? &img_volume_wave3
+                                 : volumePercent > 33 ? &img_volume_wave2
+                                                       : &img_volume_wave1;
+    lv_image_set_src(speakerMuteWaveIcon, src);
+  }
+}
+
+void buildSpeakerMuteScreen(lv_obj_t *scr) {
+  lv_obj_set_style_bg_color(scr, lv_color_black(), 0);
+  lv_obj_set_style_bg_opa(scr, LV_OPA_COVER, 0);
+
+  // Same ring/caption/icon sizing as Volume for visual consistency between
+  // the two globally-triggered overlay screens.
+  speakerMuteArc = makeRingGauge(scr, 350, 32, lv_color_hex(SPEAKER_MUTE_ACCENT_COLOR));
+
+  lv_obj_t *caption = lv_label_create(scr);
+  lv_obj_set_style_text_font(caption, &lv_font_montserrat_22, 0);
+  lv_obj_set_style_text_color(caption, lv_color_hex(SPEAKER_MUTE_ACCENT_COLOR), 0);
+  lv_label_set_text(caption, "SPEAKER");
+  lv_obj_align(caption, LV_ALIGN_CENTER, 0, -95);
+
+  speakerMuteIcon = lv_image_create(scr);
+  lv_image_set_src(speakerMuteIcon, &img_speaker_muted);
+  lv_obj_set_style_image_recolor(speakerMuteIcon, lv_color_hex(SPEAKER_MUTE_ACCENT_COLOR), 0);
+  lv_obj_set_style_image_recolor_opa(speakerMuteIcon, LV_OPA_COVER, 0);
+  lv_obj_align(speakerMuteIcon, LV_ALIGN_CENTER, 0, -50);
+
+  speakerMuteWaveIcon = lv_image_create(scr);
+  lv_image_set_src(speakerMuteWaveIcon, &img_volume_wave3);
+  lv_obj_set_style_image_recolor(speakerMuteWaveIcon, lv_color_hex(SPEAKER_MUTE_ACCENT_COLOR), 0);
+  lv_obj_set_style_image_recolor_opa(speakerMuteWaveIcon, LV_OPA_COVER, 0);
+  lv_obj_align(speakerMuteWaveIcon, LV_ALIGN_CENTER, 0, -50);
+
+  // "MUTED"/"LIVE" is a word, not a number, so it uses the same built-in
+  // font as Home's labels rather than the custom digit-only font made for
+  // Volume's number.
+  speakerMuteLabel = lv_label_create(scr);
+  lv_obj_set_style_text_font(speakerMuteLabel, &lv_font_montserrat_28, 0);
+  lv_obj_set_style_text_color(speakerMuteLabel, lv_color_white(), 0);
+  lv_obj_align(speakerMuteLabel, LV_ALIGN_CENTER, 0, 15);
+
+  updateSpeakerMuteScreen();
+}
+
+// Called on every knob button press, from any screen — mirrors
+// showVolumeOverlay()'s pattern (remember previous screen, 5s fuse to
+// restore it) but for a toggle instead of a continuous value.
+void showSpeakerMuteOverlay() {
+  lv_obj_t *active = lv_screen_active();
+  if (active != speakerMuteScreen) {
+    previousScreen = active;
+    lv_screen_load(speakerMuteScreen);
+  }
+  speakerMuted = !speakerMuted;
+  ConsumerControl.press(CONSUMER_CONTROL_MUTE);
+  ConsumerControl.release();
+  updateSpeakerMuteScreen();
+  lastSpeakerMuteActivityMs = millis();
 }
 
 void setupDisplay() {
@@ -353,6 +500,8 @@ void setupLVGL() {
   buildHomeScreen(homeScreen);
   volumeScreen = lv_obj_create(NULL);
   buildVolumeScreen(volumeScreen);
+  speakerMuteScreen = lv_obj_create(NULL);
+  buildSpeakerMuteScreen(speakerMuteScreen);
   previousScreen = homeScreen;
   lv_screen_load(homeScreen);
 
@@ -457,7 +606,17 @@ void loop() {
   }
 
   // 5s-after-last-turn fuse: restore whatever screen Volume interrupted.
-  if (lv_screen_active() == volumeScreen && (millis() - lastVolumeActivityMs) > VOLUME_RETURN_MS) {
+  if (lv_screen_active() == volumeScreen && (millis() - lastVolumeActivityMs) > OVERLAY_RETURN_MS) {
+    lv_screen_load(previousScreen);
+  }
+  // Same fuse for Speaker Mute, but only while *not* muted (Brian: "when
+  // muted, it should not [return] to the main screen... only return after
+  // unmuting") — staying muted is a deliberate, persistent state worth
+  // keeping visible indefinitely, unlike Volume's transient adjustments.
+  // The fuse only starts counting once you unmute (lastSpeakerMuteActivityMs
+  // resets on every button press, so unmuting gets its own fresh 5s window).
+  if (lv_screen_active() == speakerMuteScreen && !speakerMuted &&
+      (millis() - lastSpeakerMuteActivityMs) > OVERLAY_RETURN_MS) {
     lv_screen_load(previousScreen);
   }
 
@@ -467,8 +626,7 @@ void loop() {
     uint32_t now = millis();
     if (key == LOW && (now - lastKeyMs) > DEBOUNCE_MS) {
       lastKeyMs = now;
-      ConsumerControl.press(CONSUMER_CONTROL_MUTE);
-      ConsumerControl.release();
+      showSpeakerMuteOverlay(); // sends the HID mute pulse itself
       Serial.println("MUTE");
     }
   }
