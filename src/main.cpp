@@ -36,6 +36,57 @@ Arduino_CO5300 *gfx = new Arduino_CO5300(
 
 bool displayOk = false;
 
+// Placeholder values until the companion app protocol exists (see
+// PROGRESS.md's "Next" list) — proving the ring-gauge rendering works on
+// real hardware first, same as every other piece of this firmware so far.
+float cpuPercent = 42;
+float gpuPercent = 54;
+float ramPercent = 61;
+
+// One ring = a dim full-circle "track" plus a colored arc for the value,
+// swept clockwise starting from 12 o'clock (-90°) — matches the watch-face
+// mockup from the original UI brainstorm. Arduino_GFX's fillArc uses
+// standard math angle convention (0°=3 o'clock), which appears clockwise on
+// screen since screen Y increases downward — confirmed by visual check on
+// hardware, not just assumed from reading the source.
+void drawRingGauge(int16_t cx, int16_t cy, int16_t rOuter, int16_t rInner, float pct, uint16_t color) {
+  gfx->fillArc(cx, cy, rOuter, rInner, 0, 360, DARKGREY);
+  if (pct > 0) {
+    float endAngle = -90 + (pct / 100.0f) * 360.0f;
+    gfx->fillArc(cx, cy, rOuter, rInner, -90, endAngle, color);
+  }
+}
+
+void drawHomeScreen() {
+  gfx->fillScreen(BLACK);
+
+  constexpr int16_t cx = SCREEN_WIDTH / 2;
+  constexpr int16_t cy = SCREEN_HEIGHT / 2;
+
+  // DIAGNOSTIC (2026-08-06): rings weren't showing up at all — not even the
+  // colored value-arc segments, which use the same colors as text that DID
+  // render fine. Isolating whether this is arc-specific or something
+  // broader about non-full-screen fills on this display. Remove once
+  // resolved.
+  gfx->fillRect(20, 20, 60, 60, RED);
+  gfx->fillCircle(100, 100, 30, MAGENTA);
+
+  drawRingGauge(cx, cy, 185, 165, cpuPercent, ORANGE);
+  drawRingGauge(cx, cy, 160, 140, gpuPercent, BLUE);
+  drawRingGauge(cx, cy, 135, 115, ramPercent, GREEN);
+
+  gfx->setTextSize(2);
+  gfx->setTextColor(ORANGE);
+  gfx->setCursor(cx - 70, cy - 40);
+  gfx->printf("CPU %d%%", (int)cpuPercent);
+  gfx->setTextColor(BLUE);
+  gfx->setCursor(cx - 70, cy - 10);
+  gfx->printf("GPU %d%%", (int)gpuPercent);
+  gfx->setTextColor(GREEN);
+  gfx->setCursor(cx - 70, cy + 20);
+  gfx->printf("RAM %d%%", (int)ramPercent);
+}
+
 void setupDisplay() {
   pinMode(SCREEN_EN, OUTPUT);
   digitalWrite(SCREEN_EN, HIGH);
@@ -47,12 +98,8 @@ void setupDisplay() {
   }
   Serial.println("Display init OK");
 
-  gfx->fillScreen(BLACK);
   gfx->setBrightness(200);
-  gfx->setCursor(60, 180);
-  gfx->setTextColor(WHITE);
-  gfx->setTextSize(2);
-  gfx->println("T-Encoder Pro");
+  drawHomeScreen();
 }
 
 // Touch bring-up only at this stage — same "prove it works before building
