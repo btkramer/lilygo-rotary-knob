@@ -66,8 +66,11 @@ void setupTouch() {
 // Placeholder values until the companion app protocol exists (see
 // PROGRESS.md's "Next" list) — proving the LVGL screen rendering works on
 // real hardware first, same as every other piece of this firmware so far.
-float cpuPercent = 42;
-float gpuPercent = 54;
+// CPU/GPU are temperatures (°C), not percentages — matches the original
+// mockup, which shows "CPU 42°"/"GPU 54°" but "RAM 61%". Named accordingly
+// (fixed 2026-08-06 after the Home screen mislabeled all three as %).
+float cpuTempC = 42;
+float gpuTempC = 54;
 float ramPercent = 61;
 
 // LVGL owns its own draw buffer and rendering entirely — this replaces the
@@ -159,11 +162,14 @@ lv_obj_t *makeRingLabel(lv_obj_t *parent, int16_t yOffset, lv_color_t color) {
 }
 
 void updateHomeScreen() {
-  lv_arc_set_value(cpuArc, (int)cpuPercent);
-  lv_arc_set_value(gpuArc, (int)gpuPercent);
+  // The arcs still take a 0-100 value regardless of unit — temperature and
+  // percentage both happen to live in a sane 0-100 range for a ring gauge,
+  // same as the mockup implicitly assumes (pct=42 drawn for "42°").
+  lv_arc_set_value(cpuArc, (int)cpuTempC);
+  lv_arc_set_value(gpuArc, (int)gpuTempC);
   lv_arc_set_value(ramArc, (int)ramPercent);
-  lv_label_set_text_fmt(cpuLabel, "CPU %d%%", (int)cpuPercent);
-  lv_label_set_text_fmt(gpuLabel, "GPU %d%%", (int)gpuPercent);
+  lv_label_set_text_fmt(cpuLabel, "CPU %d°", (int)cpuTempC);
+  lv_label_set_text_fmt(gpuLabel, "GPU %d°", (int)gpuTempC);
   lv_label_set_text_fmt(ramLabel, "RAM %d%%", (int)ramPercent);
 }
 
