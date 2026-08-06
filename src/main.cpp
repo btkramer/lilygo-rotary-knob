@@ -21,6 +21,12 @@ void setup() {
 void loop() {
   static int lastA = -1;
   static int lastKey = -1;
+  static uint32_t lastHeartbeat = 0;
+
+  if (millis() - lastHeartbeat > 500) {
+    Serial.println("alive");
+    lastHeartbeat = millis();
+  }
 
   int a = digitalRead(PIN_ENCODER_A);
   int key = digitalRead(PIN_ENCODER_KEY);
