@@ -12,6 +12,7 @@
 #include "USBHIDConsumerControl.h"
 #include "secrets.h"
 #include "pin_config.h"
+#include "FreeSansBold18pt7b.h"
 
 constexpr uint32_t DEBOUNCE_MS = 30;
 constexpr uint32_t WIFI_CONNECT_TIMEOUT_MS = 10000;
@@ -28,11 +29,20 @@ USBHIDConsumerControl ConsumerControl;
 // batch; don't assume SH8601 if working from their example code elsewhere.
 Arduino_DataBus *displayBus = new Arduino_ESP32QSPI(
     SCREEN_CS, SCREEN_SCLK, SCREEN_SDIO0, SCREEN_SDIO1, SCREEN_SDIO2, SCREEN_SDIO3);
-// Typed as Arduino_CO5300*, not the base Arduino_GFX*, specifically so
-// setBrightness() (a CO5300 extension, not in the base drawing-primitive
-// interface) is callable without a cast.
-Arduino_CO5300 *gfx = new Arduino_CO5300(
+// panel = the real hardware driver, kept as its own pointer (not just `gfx`)
+// specifically so setBrightness() (a CO5300 extension, not in the base
+// drawing-primitive interface) stays reachable without a cast.
+Arduino_CO5300 *panel = new Arduino_CO5300(
     displayBus, SCREEN_RST, 0 /* rotation */, false /* IPS */, SCREEN_WIDTH, SCREEN_HEIGHT);
+// All drawing happens against an offscreen PSRAM-backed canvas, not the
+// panel directly. fillArc/fillCircle rendered corrupted (striped) when drawn
+// straight to the panel (2026-08-06, see PROGRESS.md "Display rendering
+// bug") — many small per-scanline QSPI writes are the suspected cause.
+// Canvas sidesteps that entirely: draw to RAM, then one contiguous flush().
+// aligned_alloc's underlying allocator automatically routes allocations this
+// size (390*390*2 =~ 297KB, well over the ~16KB internal-vs-PSRAM threshold)
+// to PSRAM once qio_opi is enabled, so no explicit ps_malloc call is needed.
+Arduino_Canvas *gfx = new Arduino_Canvas(SCREEN_WIDTH, SCREEN_HEIGHT, panel);
 
 bool displayOk = false;
 
@@ -49,8 +59,14 @@ float ramPercent = 61;
 // standard math angle convention (0°=3 o'clock), which appears clockwise on
 // screen since screen Y increases downward — confirmed by visual check on
 // hardware, not just assumed from reading the source.
+// True near-black, not DARKGREY (0x7BEF, mid-grey) — the track should
+// blend into the true-black background per the original watch-face design
+// (AMOLED burn-in mitigation), just barely visible as a guide ring rather
+// than standing out. DARKGREY looked like a plain grey ring in practice.
+constexpr uint16_t RING_TRACK_COLOR = 0x0841; // ~(8,8,8) in RGB565, near-black
+
 void drawRingGauge(int16_t cx, int16_t cy, int16_t rOuter, int16_t rInner, float pct, uint16_t color) {
-  gfx->fillArc(cx, cy, rOuter, rInner, 0, 360, DARKGREY);
+  gfx->fillArc(cx, cy, rOuter, rInner, 0, 360, RING_TRACK_COLOR);
   if (pct > 0) {
     float endAngle = -90 + (pct / 100.0f) * 360.0f;
     gfx->fillArc(cx, cy, rOuter, rInner, -90, endAngle, color);
@@ -63,34 +79,38 @@ void drawHomeScreen() {
   constexpr int16_t cx = SCREEN_WIDTH / 2;
   constexpr int16_t cy = SCREEN_HEIGHT / 2;
 
-  // DIAGNOSTIC (2026-08-06): rings weren't showing up at all — not even the
-  // colored value-arc segments, which use the same colors as text that DID
-  // render fine. Isolating whether this is arc-specific or something
-  // broader about non-full-screen fills on this display. Remove once
-  // resolved.
-  gfx->fillRect(20, 20, 60, 60, RED);
-  gfx->fillCircle(100, 100, 30, MAGENTA);
-
   drawRingGauge(cx, cy, 185, 165, cpuPercent, ORANGE);
   drawRingGauge(cx, cy, 160, 140, gpuPercent, BLUE);
   drawRingGauge(cx, cy, 135, 115, ramPercent, GREEN);
 
-  gfx->setTextSize(2);
+  // GFXfont cursor Y is the text baseline, not top-left like the default
+  // bitmap font — row positions below are baselines, not top edges. Native
+  // 18pt glyphs at textSize(1), not a smaller font scaled up 2x — scaling
+  // duplicates pixels (blockier edges); a font that's the right size natively
+  // looks cleaner even though it's still a 1-bit bitmap font either way (this
+  // library doesn't do true anti-aliased/greyscale glyph rendering — that'd
+  // need a different rendering pipeline, e.g. LVGL, not just a font swap).
+  gfx->setFont(&FreeSansBold18pt7b);
+  gfx->setTextSize(1);
   gfx->setTextColor(ORANGE);
-  gfx->setCursor(cx - 70, cy - 40);
+  gfx->setCursor(cx - 70, cy - 36);
   gfx->printf("CPU %d%%", (int)cpuPercent);
   gfx->setTextColor(BLUE);
-  gfx->setCursor(cx - 70, cy - 10);
+  gfx->setCursor(cx - 70, cy + 6);
   gfx->printf("GPU %d%%", (int)gpuPercent);
   gfx->setTextColor(GREEN);
-  gfx->setCursor(cx - 70, cy + 20);
+  gfx->setCursor(cx - 70, cy + 48);
   gfx->printf("RAM %d%%", (int)ramPercent);
+
+  gfx->flush();
 }
 
 void setupDisplay() {
   pinMode(SCREEN_EN, OUTPUT);
   digitalWrite(SCREEN_EN, HIGH);
 
+  // gfx->begin() (Arduino_Canvas) also calls panel->begin() internally, plus
+  // allocates the framebuffer — no separate panel->begin() call needed.
   displayOk = gfx->begin();
   if (!displayOk) {
     Serial.println("Display init FAILED");
@@ -98,7 +118,7 @@ void setupDisplay() {
   }
   Serial.println("Display init OK");
 
-  gfx->setBrightness(200);
+  panel->setBrightness(200);
   drawHomeScreen();
 }
 
