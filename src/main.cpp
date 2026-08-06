@@ -1,42 +1,66 @@
-// First bring-up sketch. Deliberately minimal: only touches pins we've
-// confirmed from LilyGo's own pin table (encoder A/B/key), so this proves
-// the toolchain + upload path works before any display/touch driver choices
-// get made. Display (SH8601A AMOLED) and touch (CHSC5816) come next, once
-// this flashes and the encoder reads correctly.
+// Volume/mic-mute peripheral: rotating the encoder sends USB HID consumer-control
+// volume up/down, pressing the knob sends mute. Requires ARDUINO_USB_MODE=0 (TinyUSB
+// composite CDC+HID) — see PROGRESS.md for why mode=1 (used during initial bring-up)
+// can't do HID at all.
 
 #include <Arduino.h>
+#include "USB.h"
+#include "USBHIDConsumerControl.h"
 
 constexpr uint8_t PIN_ENCODER_A = 1;
 constexpr uint8_t PIN_ENCODER_B = 2;
 constexpr uint8_t PIN_ENCODER_KEY = 0;
+constexpr uint32_t DEBOUNCE_MS = 30;
+
+USBHIDConsumerControl ConsumerControl;
 
 void setup() {
   Serial.begin(115200);
   pinMode(PIN_ENCODER_A, INPUT_PULLUP);
   pinMode(PIN_ENCODER_B, INPUT_PULLUP);
   pinMode(PIN_ENCODER_KEY, INPUT_PULLUP);
-  Serial.println("T-Encoder Pro bring-up: encoder pins ready");
+
+  ConsumerControl.begin();
+  USB.begin();
+
+  Serial.println("T-Encoder Pro: HID volume/mute ready");
 }
 
 void loop() {
-  static int lastA = -1;
-  static int lastKey = -1;
-  static uint32_t lastHeartbeat = 0;
-
-  if (millis() - lastHeartbeat > 500) {
-    Serial.println("alive");
-    lastHeartbeat = millis();
-  }
+  static int lastA = HIGH;
+  static int lastKey = HIGH;
+  static uint32_t lastStepMs = 0;
+  static uint32_t lastKeyMs = 0;
 
   int a = digitalRead(PIN_ENCODER_A);
-  int key = digitalRead(PIN_ENCODER_KEY);
-
   if (a != lastA) {
-    Serial.printf("A=%d B=%d\n", a, digitalRead(PIN_ENCODER_B));
     lastA = a;
+    uint32_t now = millis();
+    // Direction from B's state on A's falling edge. If this reads backwards
+    // on the real hardware, just swap the two branches below.
+    if (a == LOW && (now - lastStepMs) > DEBOUNCE_MS) {
+      lastStepMs = now;
+      if (digitalRead(PIN_ENCODER_B) == HIGH) {
+        ConsumerControl.press(CONSUMER_CONTROL_VOLUME_INCREMENT);
+        ConsumerControl.release();
+        Serial.println("VOL_UP");
+      } else {
+        ConsumerControl.press(CONSUMER_CONTROL_VOLUME_DECREMENT);
+        ConsumerControl.release();
+        Serial.println("VOL_DOWN");
+      }
+    }
   }
+
+  int key = digitalRead(PIN_ENCODER_KEY);
   if (key != lastKey) {
-    Serial.printf("KEY=%d\n", key);
     lastKey = key;
+    uint32_t now = millis();
+    if (key == LOW && (now - lastKeyMs) > DEBOUNCE_MS) {
+      lastKeyMs = now;
+      ConsumerControl.press(CONSUMER_CONTROL_MUTE);
+      ConsumerControl.release();
+      Serial.println("MUTE");
+    }
   }
 }
