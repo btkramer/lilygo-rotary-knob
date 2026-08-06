@@ -4,15 +4,47 @@
 // can't do HID at all.
 
 #include <Arduino.h>
+#include <WiFi.h>
+#include <ArduinoOTA.h>
 #include "USB.h"
 #include "USBHIDConsumerControl.h"
+#include "secrets.h"
 
 constexpr uint8_t PIN_ENCODER_A = 1;
 constexpr uint8_t PIN_ENCODER_B = 2;
 constexpr uint8_t PIN_ENCODER_KEY = 0;
 constexpr uint32_t DEBOUNCE_MS = 30;
+constexpr uint32_t WIFI_CONNECT_TIMEOUT_MS = 10000;
 
 USBHIDConsumerControl ConsumerControl;
+
+void setupOTA() {
+  WiFi.mode(WIFI_STA);
+  WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
+
+  uint32_t start = millis();
+  Serial.print("Connecting to WiFi");
+  while (WiFi.status() != WL_CONNECTED && (millis() - start) < WIFI_CONNECT_TIMEOUT_MS) {
+    delay(250);
+    Serial.print(".");
+  }
+
+  if (WiFi.status() != WL_CONNECTED) {
+    // No WiFi, no OTA — HID over USB still works fine without it.
+    Serial.println("\nWiFi connect failed, continuing without OTA");
+    return;
+  }
+
+  Serial.printf("\nWiFi connected: %s\n", WiFi.localIP().toString().c_str());
+
+  ArduinoOTA.setHostname("t-encoder-pro");
+  ArduinoOTA.setPassword(OTA_PASSWORD);
+  ArduinoOTA.onStart([]() { Serial.println("OTA: start"); });
+  ArduinoOTA.onEnd([]() { Serial.println("OTA: done"); });
+  ArduinoOTA.onError([](ota_error_t error) { Serial.printf("OTA error: %u\n", error); });
+  ArduinoOTA.begin();
+  Serial.println("OTA ready");
+}
 
 void setup() {
   Serial.begin(115200);
@@ -23,6 +55,8 @@ void setup() {
   ConsumerControl.begin();
   USB.begin();
 
+  setupOTA();
+
   Serial.println("T-Encoder Pro: HID volume/mute ready");
 }
 
@@ -31,6 +65,8 @@ void loop() {
   static int lastKey = HIGH;
   static uint32_t lastStepMs = 0;
   static uint32_t lastKeyMs = 0;
+
+  ArduinoOTA.handle();
 
   int a = digitalRead(PIN_ENCODER_A);
   if (a != lastA) {
