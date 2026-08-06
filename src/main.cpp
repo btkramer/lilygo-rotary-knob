@@ -8,11 +8,11 @@
 #include <ArduinoOTA.h>
 #include <Arduino_GFX_Library.h>
 #include <TouchDrv.hpp>
+#include <lvgl.h>
 #include "USB.h"
 #include "USBHIDConsumerControl.h"
 #include "secrets.h"
 #include "pin_config.h"
-#include "FreeSansBold18pt7b.h"
 
 constexpr uint32_t DEBOUNCE_MS = 30;
 constexpr uint32_t WIFI_CONNECT_TIMEOUT_MS = 10000;
@@ -29,105 +29,21 @@ USBHIDConsumerControl ConsumerControl;
 // batch; don't assume SH8601 if working from their example code elsewhere.
 Arduino_DataBus *displayBus = new Arduino_ESP32QSPI(
     SCREEN_CS, SCREEN_SCLK, SCREEN_SDIO0, SCREEN_SDIO1, SCREEN_SDIO2, SCREEN_SDIO3);
-// panel = the real hardware driver, kept as its own pointer (not just `gfx`)
-// specifically so setBrightness() (a CO5300 extension, not in the base
-// drawing-primitive interface) stays reachable without a cast.
+// panel = the real hardware driver. setBrightness() is a CO5300 extension,
+// not in the base Arduino_GFX interface, so this stays its own concrete
+// pointer rather than the base class type.
 Arduino_CO5300 *panel = new Arduino_CO5300(
     displayBus, SCREEN_RST, 0 /* rotation */, false /* IPS */, SCREEN_WIDTH, SCREEN_HEIGHT);
-// All drawing happens against an offscreen PSRAM-backed canvas, not the
-// panel directly. fillArc/fillCircle rendered corrupted (striped) when drawn
-// straight to the panel (2026-08-06, see PROGRESS.md "Display rendering
-// bug") — many small per-scanline QSPI writes are the suspected cause.
-// Canvas sidesteps that entirely: draw to RAM, then one contiguous flush().
-// aligned_alloc's underlying allocator automatically routes allocations this
-// size (390*390*2 =~ 297KB, well over the ~16KB internal-vs-PSRAM threshold)
-// to PSRAM once qio_opi is enabled, so no explicit ps_malloc call is needed.
-Arduino_Canvas *gfx = new Arduino_Canvas(SCREEN_WIDTH, SCREEN_HEIGHT, panel);
 
 bool displayOk = false;
-
-// Placeholder values until the companion app protocol exists (see
-// PROGRESS.md's "Next" list) — proving the ring-gauge rendering works on
-// real hardware first, same as every other piece of this firmware so far.
-float cpuPercent = 42;
-float gpuPercent = 54;
-float ramPercent = 61;
-
-// One ring = a dim full-circle "track" plus a colored arc for the value,
-// swept clockwise starting from 12 o'clock (-90°) — matches the watch-face
-// mockup from the original UI brainstorm. Arduino_GFX's fillArc uses
-// standard math angle convention (0°=3 o'clock), which appears clockwise on
-// screen since screen Y increases downward — confirmed by visual check on
-// hardware, not just assumed from reading the source.
-// True near-black, not DARKGREY (0x7BEF, mid-grey) — the track should
-// blend into the true-black background per the original watch-face design
-// (AMOLED burn-in mitigation), just barely visible as a guide ring rather
-// than standing out. DARKGREY looked like a plain grey ring in practice.
-constexpr uint16_t RING_TRACK_COLOR = 0x0841; // ~(8,8,8) in RGB565, near-black
-
-void drawRingGauge(int16_t cx, int16_t cy, int16_t rOuter, int16_t rInner, float pct, uint16_t color) {
-  gfx->fillArc(cx, cy, rOuter, rInner, 0, 360, RING_TRACK_COLOR);
-  if (pct > 0) {
-    float endAngle = -90 + (pct / 100.0f) * 360.0f;
-    gfx->fillArc(cx, cy, rOuter, rInner, -90, endAngle, color);
-  }
-}
-
-void drawHomeScreen() {
-  gfx->fillScreen(BLACK);
-
-  constexpr int16_t cx = SCREEN_WIDTH / 2;
-  constexpr int16_t cy = SCREEN_HEIGHT / 2;
-
-  drawRingGauge(cx, cy, 185, 165, cpuPercent, ORANGE);
-  drawRingGauge(cx, cy, 160, 140, gpuPercent, BLUE);
-  drawRingGauge(cx, cy, 135, 115, ramPercent, GREEN);
-
-  // GFXfont cursor Y is the text baseline, not top-left like the default
-  // bitmap font — row positions below are baselines, not top edges. Native
-  // 18pt glyphs at textSize(1), not a smaller font scaled up 2x — scaling
-  // duplicates pixels (blockier edges); a font that's the right size natively
-  // looks cleaner even though it's still a 1-bit bitmap font either way (this
-  // library doesn't do true anti-aliased/greyscale glyph rendering — that'd
-  // need a different rendering pipeline, e.g. LVGL, not just a font swap).
-  gfx->setFont(&FreeSansBold18pt7b);
-  gfx->setTextSize(1);
-  gfx->setTextColor(ORANGE);
-  gfx->setCursor(cx - 70, cy - 36);
-  gfx->printf("CPU %d%%", (int)cpuPercent);
-  gfx->setTextColor(BLUE);
-  gfx->setCursor(cx - 70, cy + 6);
-  gfx->printf("GPU %d%%", (int)gpuPercent);
-  gfx->setTextColor(GREEN);
-  gfx->setCursor(cx - 70, cy + 48);
-  gfx->printf("RAM %d%%", (int)ramPercent);
-
-  gfx->flush();
-}
-
-void setupDisplay() {
-  pinMode(SCREEN_EN, OUTPUT);
-  digitalWrite(SCREEN_EN, HIGH);
-
-  // gfx->begin() (Arduino_Canvas) also calls panel->begin() internally, plus
-  // allocates the framebuffer — no separate panel->begin() call needed.
-  displayOk = gfx->begin();
-  if (!displayOk) {
-    Serial.println("Display init FAILED");
-    return;
-  }
-  Serial.println("Display init OK");
-
-  panel->setBrightness(200);
-  drawHomeScreen();
-}
 
 // Touch bring-up only at this stage — same "prove it works before building
 // on it" approach as the encoder and display. LilyGo's README says this
 // board ships with either CHSC5816 or CST816 touch IC depending on batch;
 // CHSC5816 failed init on this actual board (confirmed via the periodic
 // status log, 2026-08-06) — consistent with the display turning out to be
-// CO5300 rather than SH8601, so trying CST816 next.
+// CO5300 rather than SH8601, so trying CST816 next. Declared before the LVGL
+// section below since its input-device read callback needs `touch` in scope.
 TouchDrvCST816 touch;
 bool touchOk = false;
 
@@ -140,6 +56,166 @@ void setupTouch() {
   }
   Serial.println("Touch init OK");
   Serial.printf("Touch model: %s, chip ID: 0x%02X\n", touch.getModelName(), touch.getChipID());
+}
+
+// Placeholder values until the companion app protocol exists (see
+// PROGRESS.md's "Next" list) — proving the LVGL screen rendering works on
+// real hardware first, same as every other piece of this firmware so far.
+float cpuPercent = 42;
+float gpuPercent = 54;
+float ramPercent = 61;
+
+// LVGL owns its own draw buffer and rendering entirely — this replaces the
+// earlier direct-to-Arduino_GFX drawHomeScreen()/drawRingGauge() approach.
+// Partial buffer (40 rows, matching Arduino_GFX's own LVGL example), not a
+// full-frame buffer: LVGL renders in chunks and calls lvDispFlush() per
+// chunk, which pushes each chunk to the panel with draw16bitRGBBitmap() — a
+// single contiguous blit per chunk, structurally the same "few large writes,
+// not many small scanline writes" shape that fixed the earlier fillArc/
+// fillCircle corruption (see PROGRESS.md "Display rendering bug"), so this
+// should avoid that failure mode too even though it's a different code path.
+constexpr uint32_t LV_BUF_ROWS = 40;
+lv_display_t *lvDisplay = nullptr;
+lv_color_t *lvDrawBuf = nullptr;
+
+lv_obj_t *cpuArc, *gpuArc, *ramArc;
+lv_obj_t *cpuLabel, *gpuLabel, *ramLabel;
+
+uint32_t lvMillisCb() { return millis(); }
+
+void lvLogPrint(lv_log_level_t level, const char *buf) {
+  LV_UNUSED(level);
+  Serial.print(buf);
+}
+
+void lvDispFlush(lv_display_t *disp, const lv_area_t *area, uint8_t *px_map) {
+  uint32_t w = lv_area_get_width(area);
+  uint32_t h = lv_area_get_height(area);
+  panel->draw16bitRGBBitmap(area->x1, area->y1, (uint16_t *)px_map, w, h);
+  lv_disp_flush_ready(disp);
+}
+
+void lvTouchpadRead(lv_indev_t *indev, lv_indev_data_t *data) {
+  if (touchOk && touch.isPressed()) {
+    TouchPoints points = touch.getTouchPoints();
+    if (points.hasPoints()) {
+      const TouchPoint &p = points.getPoint(0);
+      data->state = LV_INDEV_STATE_PRESSED;
+      data->point.x = p.x;
+      data->point.y = p.y;
+      return;
+    }
+  }
+  data->state = LV_INDEV_STATE_RELEASED;
+}
+
+// One ring = a dim full-circle "track" plus a colored value arc, swept
+// clockwise starting from 12 o'clock — matches the watch-face mockup from
+// the original UI brainstorm. LVGL's arc angle convention is 0°=3 o'clock
+// like Arduino_GFX's was, so rotation=270 (i.e. -90) shifts the whole arc's
+// coordinate frame so 0 visually lands at 12 o'clock; LV_ARC_MODE_NORMAL
+// (the default) then grows the value indicator clockwise from there.
+lv_obj_t *makeRingGauge(lv_obj_t *parent, int16_t diameter, int16_t thickness, lv_color_t color) {
+  lv_obj_t *arc = lv_arc_create(parent);
+  lv_obj_remove_style(arc, NULL, LV_PART_KNOB);
+  lv_obj_remove_flag(arc, LV_OBJ_FLAG_CLICKABLE);
+  lv_obj_set_size(arc, diameter, diameter);
+  lv_obj_center(arc);
+  lv_arc_set_bg_angles(arc, 0, 360);
+  lv_arc_set_rotation(arc, 270);
+  lv_arc_set_range(arc, 0, 100);
+  // True near-black, not a plain grey — the track should blend into the
+  // true-black background per the original watch-face design (AMOLED
+  // burn-in mitigation), just barely visible as a guide ring. Confirmed on
+  // hardware with the equivalent color in the pre-LVGL version.
+  lv_obj_set_style_arc_color(arc, lv_color_hex(0x141414), LV_PART_MAIN);
+  lv_obj_set_style_arc_width(arc, thickness, LV_PART_MAIN);
+  lv_obj_set_style_arc_rounded(arc, false, LV_PART_MAIN);
+  lv_obj_set_style_arc_color(arc, color, LV_PART_INDICATOR);
+  lv_obj_set_style_arc_width(arc, thickness, LV_PART_INDICATOR);
+  lv_obj_set_style_arc_rounded(arc, false, LV_PART_INDICATOR);
+  return arc;
+}
+
+lv_obj_t *makeRingLabel(lv_obj_t *parent, int16_t yOffset, lv_color_t color) {
+  lv_obj_t *label = lv_label_create(parent);
+  lv_obj_set_style_text_font(label, &lv_font_montserrat_28, 0);
+  lv_obj_set_style_text_color(label, color, 0);
+  lv_obj_align(label, LV_ALIGN_CENTER, 0, yOffset);
+  return label;
+}
+
+void updateHomeScreen() {
+  lv_arc_set_value(cpuArc, (int)cpuPercent);
+  lv_arc_set_value(gpuArc, (int)gpuPercent);
+  lv_arc_set_value(ramArc, (int)ramPercent);
+  lv_label_set_text_fmt(cpuLabel, "CPU %d%%", (int)cpuPercent);
+  lv_label_set_text_fmt(gpuLabel, "GPU %d%%", (int)gpuPercent);
+  lv_label_set_text_fmt(ramLabel, "RAM %d%%", (int)ramPercent);
+}
+
+void buildHomeScreen() {
+  lv_obj_t *scr = lv_scr_act();
+  lv_obj_set_style_bg_color(scr, lv_color_black(), 0);
+  lv_obj_set_style_bg_opa(scr, LV_OPA_COVER, 0);
+
+  // Diameters/thickness match the outer/inner radius pairs from the
+  // pre-LVGL version (185/165, 160/140, 135/115) — same visual layout.
+  cpuArc = makeRingGauge(scr, 370, 20, lv_color_hex(0xFF8C00));
+  gpuArc = makeRingGauge(scr, 320, 20, lv_color_hex(0x0080FF));
+  ramArc = makeRingGauge(scr, 270, 20, lv_color_hex(0x00C853));
+
+  cpuLabel = makeRingLabel(scr, -44, lv_color_hex(0xFF8C00));
+  gpuLabel = makeRingLabel(scr, 0, lv_color_hex(0x0080FF));
+  ramLabel = makeRingLabel(scr, 44, lv_color_hex(0x00C853));
+
+  updateHomeScreen();
+}
+
+void setupDisplay() {
+  pinMode(SCREEN_EN, OUTPUT);
+  digitalWrite(SCREEN_EN, HIGH);
+
+  displayOk = panel->begin();
+  if (!displayOk) {
+    Serial.println("Display init FAILED");
+    return;
+  }
+  Serial.println("Display init OK");
+
+  panel->setBrightness(200);
+  panel->fillScreen(BLACK); // clear before LVGL takes over, avoid boot-time garbage
+}
+
+void setupLVGL() {
+  if (!displayOk) return;
+
+  lv_init();
+  lv_tick_set_cb(lvMillisCb);
+#if LV_USE_LOG
+  lv_log_register_print_cb(lvLogPrint);
+#endif
+
+  uint32_t bufPixels = SCREEN_WIDTH * LV_BUF_ROWS;
+  lvDrawBuf = (lv_color_t *)heap_caps_malloc(bufPixels * sizeof(lv_color_t), MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
+  if (!lvDrawBuf) {
+    lvDrawBuf = (lv_color_t *)heap_caps_malloc(bufPixels * sizeof(lv_color_t), MALLOC_CAP_8BIT);
+  }
+  if (!lvDrawBuf) {
+    Serial.println("LVGL draw buffer allocation FAILED");
+    return;
+  }
+
+  lvDisplay = lv_display_create(SCREEN_WIDTH, SCREEN_HEIGHT);
+  lv_display_set_flush_cb(lvDisplay, lvDispFlush);
+  lv_display_set_buffers(lvDisplay, lvDrawBuf, NULL, bufPixels * sizeof(lv_color_t), LV_DISPLAY_RENDER_MODE_PARTIAL);
+
+  lv_indev_t *indev = lv_indev_create();
+  lv_indev_set_type(indev, LV_INDEV_TYPE_POINTER);
+  lv_indev_set_read_cb(indev, lvTouchpadRead);
+
+  buildHomeScreen();
+  Serial.println("LVGL init OK");
 }
 
 void setupOTA() {
@@ -183,6 +259,7 @@ void setup() {
 
   setupDisplay();
   setupTouch();
+  setupLVGL();
   setupOTA();
 
   Serial.println("T-Encoder Pro: HID volume/mute ready");
@@ -197,13 +274,9 @@ void loop() {
 
   ArduinoOTA.handle();
 
-  if (touchOk && touch.isPressed()) {
-    TouchPoints points = touch.getTouchPoints();
-    if (points.hasPoints()) {
-      const TouchPoint &p = points.getPoint(0);
-      Serial.printf("TOUCH x=%d y=%d\n", p.x, p.y);
-    }
-  }
+  // LVGL now owns touch reads (via lvTouchpadRead(), called through this) —
+  // no separate manual touch-print block needed anymore.
+  lv_timer_handler();
 
   // Periodic, not just at-boot: one-time boot messages are easy to miss
   // when reading serial after the fact (the display/touch init messages
@@ -251,4 +324,6 @@ void loop() {
       Serial.println("MUTE");
     }
   }
+
+  delay(5); // matches Arduino_GFX's own LVGL example's loop cadence
 }
