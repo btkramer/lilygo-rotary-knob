@@ -20,6 +20,8 @@ USBHIDConsumerControl ConsumerControl;
 
 void setupOTA() {
   WiFi.mode(WIFI_STA);
+  WiFi.setHostname("t-encoder-pro"); // DHCP/router-visible name — separate from
+                                      // ArduinoOTA's mDNS hostname below, both needed
   WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
 
   uint32_t start = millis();
@@ -65,8 +67,21 @@ void loop() {
   static int lastKey = HIGH;
   static uint32_t lastStepMs = 0;
   static uint32_t lastKeyMs = 0;
+  static uint32_t lastStatusMs = 0;
 
   ArduinoOTA.handle();
+
+  // Periodic, not just at-boot: a one-time boot message is easy to miss
+  // when reading serial after the fact. This makes WiFi/IP status visible
+  // no matter when you happen to be listening.
+  if (millis() - lastStatusMs > 10000) {
+    lastStatusMs = millis();
+    if (WiFi.status() == WL_CONNECTED) {
+      Serial.printf("status: wifi up, ip=%s\n", WiFi.localIP().toString().c_str());
+    } else {
+      Serial.println("status: wifi down");
+    }
+  }
 
   int a = digitalRead(PIN_ENCODER_A);
   if (a != lastA) {
