@@ -112,7 +112,20 @@ void lvDispFlush(lv_display_t *disp, const lv_area_t *area, uint8_t *px_map) {
 }
 
 void lvTouchpadRead(lv_indev_t *indev, lv_indev_data_t *data) {
-  if (touchOk && touch.isPressed()) {
+  // Deliberately does NOT gate on touch.isPressed(): with an IRQ pin
+  // configured (ours is, see setupTouch()), that call does a raw
+  // digitalRead() of the interrupt line rather than real touch state (see
+  // TouchDrvInterface.hpp's isPressed() doc comment: "suitable for screens
+  // with an interrupt pin... For devices without an interrupt pin, simply
+  // call getTouchPoints"). The CST816's INT line pulses briefly per touch
+  // *report*, it isn't held low for the whole drag, so most ~30ms polls
+  // caught it HIGH mid-swipe (looking "released") even with a finger still
+  // down — this was the root cause of swipe-up gestures being unreliable
+  // (2026-08-06, diagnosed via temporary on-screen instrumentation, since
+  // removed — see PROGRESS.md). getTouchPoints() does a genuine fresh I2C
+  // register read every call, independent of the interrupt pin, so it alone
+  // is enough to detect press state reliably.
+  if (touchOk) {
     TouchPoints points = touch.getTouchPoints();
     if (points.hasPoints()) {
       const TouchPoint &p = points.getPoint(0);
@@ -140,6 +153,20 @@ lv_obj_t *makeRingGauge(lv_obj_t *parent, int16_t diameter, int16_t thickness, l
   lv_arc_set_bg_angles(arc, 0, 360);
   lv_arc_set_rotation(arc, 270);
   lv_arc_set_range(arc, 0, 100);
+  // lv_arc_set_range() above is a no-op when the range already matches
+  // lv_arc_create()'s own default (0-100, which it does) — it early-returns
+  // before ever clamping the arc's internal value out of its "unset"
+  // sentinel state. A freshly-created arc's indicator angles default to a
+  // fixed 135°-270° sweep (LVGL's own generic-gauge look) and stay stuck
+  // there — showing a visible partial arc — until something actually calls
+  // lv_arc_set_value(). Every screen except Quick-jump happens to call that
+  // via its own update*Screen() right after building, which is what masked
+  // this; Quick-jump's ring never got a value at all and visibly showed the
+  // leftover default arc (Brian: "partially filled light blue arc... what
+  // is that for?"). Setting it explicitly here means every ring this helper
+  // builds starts in a real "empty" state regardless of what its caller
+  // does afterward.
+  lv_arc_set_value(arc, 0);
   // True near-black, not a plain grey — the track should blend into the
   // true-black background per the original watch-face design (AMOLED
   // burn-in mitigation), just barely visible as a guide ring. Confirmed on
@@ -176,6 +203,7 @@ void updateHomeScreen() {
 void buildHomeScreen(lv_obj_t *scr) {
   lv_obj_set_style_bg_color(scr, lv_color_black(), 0);
   lv_obj_set_style_bg_opa(scr, LV_OPA_COVER, 0);
+  lv_obj_remove_flag(scr, LV_OBJ_FLAG_SCROLLABLE); // no scrollable content; keeps swipe-up gesture detection reliable
 
   // Diameters/thickness match the outer/inner radius pairs from the
   // pre-LVGL version (185/165, 160/140, 135/115) — same visual layout.
@@ -261,6 +289,7 @@ void updateVolumeScreen() {
 void buildVolumeScreen(lv_obj_t *scr) {
   lv_obj_set_style_bg_color(scr, lv_color_black(), 0);
   lv_obj_set_style_bg_opa(scr, LV_OPA_COVER, 0);
+  lv_obj_remove_flag(scr, LV_OBJ_FLAG_SCROLLABLE);
 
   // Ring: 350 diameter, 32 thickness (inner radius 143). Text sizes went
   // through several rounds of "a little bigger" (2026-08-06): captions and
@@ -398,6 +427,7 @@ void updateSpeakerMuteScreen() {
 void buildSpeakerMuteScreen(lv_obj_t *scr) {
   lv_obj_set_style_bg_color(scr, lv_color_black(), 0);
   lv_obj_set_style_bg_opa(scr, LV_OPA_COVER, 0);
+  lv_obj_remove_flag(scr, LV_OBJ_FLAG_SCROLLABLE);
 
   // Same ring/caption/icon sizing as Volume for visual consistency between
   // the two globally-triggered overlay screens.
@@ -448,6 +478,165 @@ void showSpeakerMuteOverlay() {
   lastSpeakerMuteActivityMs = millis();
 }
 
+// Quick-jump grid: the only way to jump straight to a screen out of the
+// normal swipe/rotate order (see PROGRESS.md's design decisions — "Swipe up
+// = quick-jump grid, the only way to open it"). Layout matches the original
+// mockup's compass positions: Home at top, Speaker Mute at bottom-left, Now
+// Playing at bottom-right — Now Playing's spot is dimmed/inert since that
+// screen doesn't exist yet (see PROGRESS.md's "Next" list), kept in place so
+// the layout doesn't need to shift once it's built. No Volume spot, by
+// design — Volume stays rotate-only and excluded from both swipe nav and
+// this grid, same reasoning as the mockup's "No Volume icon, rotate-only."
+constexpr uint32_t QUICK_JUMP_RING_COLOR = 0x2EC4B6;        // teal, matches the mockup's Quick-jump card
+constexpr uint32_t QUICK_JUMP_HOME_COLOR = 0xE0A940;        // same gold as Home's CPU ring
+constexpr uint32_t QUICK_JUMP_NOW_PLAYING_COLOR = 0x4FB477; // same green as the mockup's Now Playing card
+// Longer than OVERLAY_RETURN_MS (5s) — this is a browsed menu you look at
+// and choose from, not a transient nudge like Volume/Speaker Mute.
+constexpr uint32_t QUICK_JUMP_RETURN_MS = 8000;
+
+lv_obj_t *quickJumpScreen;
+uint32_t lastQuickJumpActivityMs = 0;
+
+// One circular "spot": dark filled circle, colored border, colored icon
+// centered inside — mirrors the mockup's `.menu-spot` styling. Pass either
+// an LV_SYMBOL_* glyph (bitmap-based font icon, e.g. LV_SYMBOL_HOME) or a
+// pre-rendered lv_image_dsc_t (for the Speaker Mute spot, which reuses the
+// existing slashed-speaker bitmap) — not both.
+lv_obj_t *makeQuickJumpSpot(lv_obj_t *parent, int16_t xOffset, int16_t yOffset,
+                             lv_color_t color, const char *iconSymbol,
+                             const lv_image_dsc_t *imgSrc) {
+  lv_obj_t *spot = lv_obj_create(parent);
+  lv_obj_remove_flag(spot, LV_OBJ_FLAG_SCROLLABLE);
+  lv_obj_set_size(spot, 76, 76);
+  lv_obj_set_style_radius(spot, LV_RADIUS_CIRCLE, 0);
+  lv_obj_set_style_bg_color(spot, lv_color_hex(0x141414), 0);
+  lv_obj_set_style_bg_opa(spot, LV_OPA_COVER, 0);
+  lv_obj_set_style_border_width(spot, 2, 0);
+  lv_obj_set_style_border_color(spot, color, 0);
+  lv_obj_set_style_pad_all(spot, 0, 0);
+  lv_obj_align(spot, LV_ALIGN_CENTER, xOffset, yOffset);
+
+  if (iconSymbol) {
+    lv_obj_t *icon = lv_label_create(spot);
+    lv_obj_set_style_text_font(icon, &lv_font_montserrat_28, 0);
+    lv_obj_set_style_text_color(icon, color, 0);
+    lv_label_set_text(icon, iconSymbol);
+    lv_obj_center(icon);
+  } else if (imgSrc) {
+    lv_obj_t *icon = lv_image_create(spot);
+    lv_image_set_src(icon, imgSrc);
+    lv_obj_set_style_image_recolor(icon, color, 0);
+    lv_obj_set_style_image_recolor_opa(icon, LV_OPA_COVER, 0);
+    lv_obj_center(icon);
+  }
+  return spot;
+}
+
+void quickJumpSpotClickedCb(lv_event_t *e) {
+  lv_screen_load((lv_obj_t *)lv_event_get_user_data(e));
+}
+
+void buildQuickJumpScreen(lv_obj_t *scr) {
+  lv_obj_set_style_bg_color(scr, lv_color_black(), 0);
+  lv_obj_set_style_bg_opa(scr, LV_OPA_COVER, 0);
+  lv_obj_remove_flag(scr, LV_OBJ_FLAG_SCROLLABLE);
+
+  // Plain dim ring, no accent segment — matches the mockup's `--pct:0` dial;
+  // this screen has no single value to show, it's a menu.
+  makeRingGauge(scr, 350, 32, lv_color_hex(QUICK_JUMP_RING_COLOR));
+
+  lv_obj_t *centerLabel = lv_label_create(scr);
+  lv_obj_set_style_text_font(centerLabel, &lv_font_montserrat_14, 0);
+  lv_obj_set_style_text_color(centerLabel, lv_color_hex(0x9AA5A3), 0);
+  lv_obj_set_style_text_letter_space(centerLabel, 2, 0);
+  lv_label_set_text(centerLabel, "TAP A SCREEN");
+  lv_obj_center(centerLabel);
+
+  lv_obj_t *homeSpot =
+      makeQuickJumpSpot(scr, 0, -120, lv_color_hex(QUICK_JUMP_HOME_COLOR), LV_SYMBOL_HOME, nullptr);
+  lv_obj_add_event_cb(homeSpot, quickJumpSpotClickedCb, LV_EVENT_CLICKED, homeScreen);
+
+  // Speaker Mute's spot (mockup's bottom-left slot) was removed (2026-08-07)
+  // — Brian found it wasn't useful in practice: the physical knob button
+  // already jumps there from any screen, and while actually muted that
+  // screen doesn't time out back to Home anyway (see loop()'s fuse check),
+  // so there was nothing left for this spot to be a *shortcut* to. It also
+  // turned out to be visibly broken — its icon was hardcoded to the slashed
+  // bitmap regardless of live speakerMuted state, always showing "muted"
+  // even when live. Not worth fixing for a spot that wasn't earning its
+  // place anyway.
+  // Now Playing doesn't exist yet — dimmed and non-interactive, but kept
+  // in place so it's ready to wire up once that screen is built (see
+  // PROGRESS.md's "Next" list). Moved to bottom-center (was bottom-right,
+  // mirroring the mockup's 3-spot layout) now that Speaker Mute's bottom-
+  // left spot is gone — centering it under Home reads better with only two
+  // spots than leaving it off to one side with an empty gap opposite it.
+  lv_obj_t *nowPlayingSpot =
+      makeQuickJumpSpot(scr, 0, 100, lv_color_hex(QUICK_JUMP_NOW_PLAYING_COLOR), LV_SYMBOL_PLAY, nullptr);
+  lv_obj_remove_flag(nowPlayingSpot, LV_OBJ_FLAG_CLICKABLE);
+  lv_obj_set_style_opa(nowPlayingSpot, LV_OPA_40, 0);
+}
+
+// Called on a detected swipe-up gesture, from Home, Volume, or Speaker Mute
+// (see quickJumpGestureCb below) — mirrors showVolumeOverlay()'s
+// remember-previous-screen pattern. Swiping up from Volume was originally
+// excluded by design (rotate-only), but Brian asked for it directly
+// (2026-08-06: "It doesn't work from the volume page, though. It should.").
+// One accepted edge case from allowing this: if quick-jump's own idle fuse
+// later restores previousScreen == volumeScreen, Volume's own fuse-check
+// (loop()) will immediately re-fire on its own stale timer — but by then
+// previousScreen has already been overwritten to volumeScreen too, so it
+// just reloads the same screen rather than looping. Same shared-global
+// tradeoff already accepted between Volume and Speaker Mute elsewhere in
+// this file.
+void showQuickJumpMenu() {
+  lv_obj_t *active = lv_screen_active();
+  if (active == quickJumpScreen) return;
+  previousScreen = active;
+  lv_screen_load(quickJumpScreen);
+  lastQuickJumpActivityMs = millis();
+}
+
+// A gesture stops bubbling up at the first child whose own
+// LV_OBJ_FLAG_GESTURE_BUBBLE isn't set (see lv_indev.c's indev_gesture()) —
+// so a swipe starting ON a widget (not empty background) would otherwise be
+// swallowed by that widget instead of ever reaching the screen-level
+// LV_EVENT_GESTURE handler below. Arcs mostly dodge this on their own (their
+// hit test only counts the ring stroke, not their full bounding box — see
+// lv_arc.c's LV_EVENT_HIT_TEST), but labels and images hit-test their whole
+// bounding box, and the ones here (CPU/GPU/RAM numbers, the mute icon) sit
+// centered — exactly where a swipe naturally starts. Every screen's content
+// is non-interactive display-only, none of it needs to claim gestures for
+// itself, so mark it all bubble-through recursively.
+void makeGestureBubbleThrough(lv_obj_t *obj) {
+  uint32_t n = lv_obj_get_child_count(obj);
+  for (uint32_t i = 0; i < n; i++) {
+    lv_obj_t *child = lv_obj_get_child(obj, i);
+    lv_obj_add_flag(child, LV_OBJ_FLAG_GESTURE_BUBBLE);
+    makeGestureBubbleThrough(child);
+  }
+}
+
+// Fires for gestures on Home, Volume, and Speaker Mute (not the grid's own
+// screen — nothing to do there). LV_DIR_TOP is LVGL's gesture direction for
+// a finger dragging upward, i.e. a swipe up. Subscribed on the indev itself
+// (see setupLVGL), not any one screen object — LVGL sends LV_EVENT_GESTURE
+// to both the "gesture_obj" (whichever object stopped the bubble-up walk,
+// see makeGestureBubbleThrough's comment) AND the indev directly
+// (lv_indev.c's indev_gesture(): `lv_indev_send_event(indev_act,
+// LV_EVENT_GESTURE, gesture_obj)`), so subscribing here catches every
+// gesture regardless of which widget it lands on, sidestepping the
+// bubbling question entirely.
+void quickJumpGestureCb(lv_event_t *e) {
+  lv_indev_t *indev = lv_indev_active();
+  if (!indev) return;
+  lv_dir_t dir = lv_indev_get_gesture_dir(indev);
+  lv_obj_t *active = lv_screen_active();
+  if (dir == LV_DIR_TOP && (active == homeScreen || active == volumeScreen || active == speakerMuteScreen)) {
+    showQuickJumpMenu();
+  }
+}
+
 void setupDisplay() {
   pinMode(SCREEN_EN, OUTPUT);
   digitalWrite(SCREEN_EN, HIGH);
@@ -495,6 +684,15 @@ void setupLVGL() {
   lv_indev_t *indev = lv_indev_create();
   lv_indev_set_type(indev, LV_INDEV_TYPE_POINTER);
   lv_indev_set_read_cb(indev, lvTouchpadRead);
+  // Default gesture distance is 50px (LV_INDEV_DEF_GESTURE_LIMIT). On a
+  // round display the touchable chord narrows fast near the top/bottom
+  // edge — exactly where a swipe-up naturally starts/ends — so it's easy
+  // for a real swipe to drift off the vertical axis before reaching 50px,
+  // which resolves the gesture to LEFT/RIGHT instead of TOP (confirmed:
+  // Brian saw both "TOP" and "LEFT" from swipe-up attempts via the debug
+  // readout, very inconsistently). Shorter threshold gives less distance
+  // for a swipe to wander off-axis.
+  lv_indev_set_gesture_min_distance(indev, 30);
 
   homeScreen = lv_obj_create(NULL);
   buildHomeScreen(homeScreen);
@@ -502,6 +700,19 @@ void setupLVGL() {
   buildVolumeScreen(volumeScreen);
   speakerMuteScreen = lv_obj_create(NULL);
   buildSpeakerMuteScreen(speakerMuteScreen);
+  quickJumpScreen = lv_obj_create(NULL);
+  buildQuickJumpScreen(quickJumpScreen);
+
+  // Swipe-up entry point for the quick-jump grid. Subscribed on the indev
+  // itself, not a screen object — see quickJumpGestureCb's comment for why
+  // (LVGL sends LV_EVENT_GESTURE to the indev too, not just whichever
+  // widget the bubble-up walk lands on). Screen filtering (Home/Speaker
+  // Mute only, not Volume) happens inside the callback instead.
+  lv_indev_add_event_cb(indev, quickJumpGestureCb, LV_EVENT_GESTURE, NULL);
+  makeGestureBubbleThrough(homeScreen); // still correct practice even though no longer load-bearing for this
+  makeGestureBubbleThrough(volumeScreen);
+  makeGestureBubbleThrough(speakerMuteScreen);
+
   previousScreen = homeScreen;
   lv_screen_load(homeScreen);
 
@@ -607,7 +818,9 @@ void loop() {
 
   // 5s-after-last-turn fuse: restore whatever screen Volume interrupted.
   if (lv_screen_active() == volumeScreen && (millis() - lastVolumeActivityMs) > OVERLAY_RETURN_MS) {
-    lv_screen_load(previousScreen);
+    lv_obj_t *restoring = previousScreen;
+    lv_screen_load(restoring);
+    if (restoring == quickJumpScreen) lastQuickJumpActivityMs = millis();
   }
   // Same fuse for Speaker Mute, but only while *not* muted (Brian: "when
   // muted, it should not [return] to the main screen... only return after
@@ -617,6 +830,13 @@ void loop() {
   // resets on every button press, so unmuting gets its own fresh 5s window).
   if (lv_screen_active() == speakerMuteScreen && !speakerMuted &&
       (millis() - lastSpeakerMuteActivityMs) > OVERLAY_RETURN_MS) {
+    lv_obj_t *restoring = previousScreen;
+    lv_screen_load(restoring);
+    if (restoring == quickJumpScreen) lastQuickJumpActivityMs = millis();
+  }
+  // Quick-jump's own, longer idle fuse: walked away without tapping
+  // anything, restore whatever screen it was opened from.
+  if (lv_screen_active() == quickJumpScreen && (millis() - lastQuickJumpActivityMs) > QUICK_JUMP_RETURN_MS) {
     lv_screen_load(previousScreen);
   }
 

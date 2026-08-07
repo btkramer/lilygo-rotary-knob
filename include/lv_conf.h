@@ -590,7 +590,14 @@
 
 /* Enable the multi-touch gesture recognition feature */
 /* Gesture recognition requires the use of floats */
-#define LV_USE_GESTURE_RECOGNITION 0
+/* Needed for Quick-jump's swipe-up entry point (2026-08-06) — in LVGL 9.5.0
+ * this flag gates the ENTIRE gesture subsystem, including plain single-
+ * finger swipe direction (LV_EVENT_GESTURE / lv_indev_get_gesture_dir()),
+ * not just true multi-touch pinch/rotate as the name suggests. With this
+ * off, gesture_dir is never set to anything but LV_DIR_NONE — confirmed by
+ * reading lv_indev.c, where every gesture_dir assignment lives inside this
+ * same #if block. See main.cpp's quickJumpGestureCb(). */
+#define LV_USE_GESTURE_RECOGNITION 1
 
 /*=====================
  *  COMPILER SETTINGS
@@ -633,7 +640,10 @@
 #define LV_ATTRIBUTE_EXTERN_DATA
 
 /** Use `float` as `lv_value_precise_t` */
-#define LV_USE_FLOAT            0
+/* Required by LV_USE_GESTURE_RECOGNITION (see that flag's comment above).
+ * ESP32-S3 has a hardware FPU, so this isn't the software-float trap it
+ * would be on an FPU-less MCU. */
+#define LV_USE_FLOAT            1
 
 /** Enable matrix support
  *  - Requires `LV_USE_FLOAT = 1` */
