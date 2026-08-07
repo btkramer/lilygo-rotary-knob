@@ -9,6 +9,9 @@
 #include <Arduino_GFX_Library.h>
 #include <TouchDrv.hpp>
 #include <lvgl.h>
+#include <AsyncTCP.h>
+#include <ESPAsyncWebServer.h>
+#include <WebSerial.h>
 #include "USB.h"
 #include "USBHIDConsumerControl.h"
 #include "secrets.h"
@@ -23,6 +26,37 @@ constexpr uint32_t DEBOUNCE_MS = 30;
 constexpr uint32_t WIFI_CONNECT_TIMEOUT_MS = 10000;
 
 USBHIDConsumerControl ConsumerControl;
+
+// Encoder reading moved from loop()-polling to a hardware interrupt
+// (2026-08-07) — polling missed/misread transitions on fast spins (Brian:
+// "sometimes skip a number or two or go in the wrong direction... usually
+// only when I turn it quickly"). loop() does real, variably-slow work every
+// iteration (LVGL's full-390x390-panel redraw+flush, ArduinoOTA.handle(),
+// WebSerial.loop()), so digitalRead(PIN_ENCODER_A) wasn't being sampled
+// often/regularly enough to catch every real quadrature transition during a
+// fast rotation — a transition landing between two loop() iterations is
+// either missed entirely (skipped step) or, worse, read alongside a B value
+// that's already moved on to the *next* transition (wrong direction), since
+// this decode assumes A and B are sampled close enough together to reflect
+// one single real transition. An interrupt captures each transition the
+// instant it happens, independent of whatever loop() is currently busy
+// doing. Direction logic (`a != b`) is unchanged from the polling version —
+// see loop()'s old comment history / PROGRESS.md for how that was derived.
+constexpr uint32_t ENCODER_ISR_DEBOUNCE_MS = 2; // contact-bounce filter only — NOT a rotation-speed throttle like the old 30ms was
+portMUX_TYPE encoderMux = portMUX_INITIALIZER_UNLOCKED;
+volatile int32_t encoderStepAccum = 0; // net detents since loop() last drained it; ISR writes, loop() reads+clears
+volatile uint32_t lastEncoderIsrMs = 0;
+
+void IRAM_ATTR encoderIsr() {
+  uint32_t now = millis();
+  if (now - lastEncoderIsrMs < ENCODER_ISR_DEBOUNCE_MS) return;
+  lastEncoderIsrMs = now;
+  bool a = digitalRead(PIN_ENCODER_A) == HIGH;
+  bool b = digitalRead(PIN_ENCODER_B) == HIGH;
+  portENTER_CRITICAL_ISR(&encoderMux);
+  encoderStepAccum += (a != b) ? 1 : -1;
+  portEXIT_CRITICAL_ISR(&encoderMux);
+}
 
 // Display bring-up only at this stage — proving the panel actually lights up
 // and responds correctly before building any real UI on top of it. Pin
@@ -234,6 +268,10 @@ constexpr int VOLUME_STEP = 2;
 constexpr uint32_t OVERLAY_RETURN_MS = 5000;
 int volumePercent = 50;
 uint32_t lastVolumeActivityMs = 0;
+// Declared together with lastVolumeActivityMs (rather than down where each
+// is actually used) since restoreScreen() below needs all three up front.
+uint32_t lastSpeakerMuteActivityMs = 0;
+uint32_t lastQuickJumpActivityMs = 0;
 
 // Volume level icons (src/img_volume_waves.c) — real FontAwesome 5 pixels,
 // same style as LV_SYMBOL_VOLUME_MID/MAX (confirmed perfect on the Speaker
@@ -253,11 +291,56 @@ extern const lv_image_dsc_t img_volume_wave3; // 3 waves (high)
 
 lv_obj_t *homeScreen;
 lv_obj_t *volumeScreen;
+// Declared together with volumeScreen (rather than where each is actually
+// built, further down) so the return-screen variables below can reference
+// all three transient screens even though Speaker Mute's and Quick-jump's
+// own build code comes later in the file.
+lv_obj_t *speakerMuteScreen;
+lv_obj_t *quickJumpScreen;
 lv_obj_t *volumeArc;
 lv_obj_t *volumeMuteIcon; // LV_SYMBOL_MUTE label, shown only at 0%
 lv_obj_t *volumeWaveIcon; // single image widget, src swapped per tier
 lv_obj_t *volumeLabel;
-lv_obj_t *previousScreen; // whatever was showing before Volume/Speaker Mute interrupted it
+
+// Real bug, found and fixed twice (2026-08-07) before landing here. First
+// attempt: a single shared `previousScreen` variable, set by whichever of
+// Volume/Speaker Mute/Quick-jump was entered most recently. Broke two ways:
+// (1) entering one transient screen from another (e.g. pressing mute while
+// looking at Volume) could set previousScreen to a transient screen itself,
+// and once that screen's own fuse later fired using a stale previousScreen
+// still pointing at itself, it reloaded onto itself — a no-op that looked
+// exactly like "the timeout doesn't work". Fixed *that* by refusing to ever
+// store a transient screen as previousScreen — but that broke the actually
+// -correct case: Brian's real workflow (turn knob -> Volume; press mute ->
+// Speaker Mute; turn knob again -> Volume interrupts Mute; wait -> should
+// return to Mute, not Home) needs previousScreen to legitimately be able to
+// point at another transient screen, since that's genuinely what got
+// interrupted. The real fix: each transient screen gets its OWN dedicated
+// "what am I covering" variable instead of sharing one. This makes
+// interruption chains resolve correctly on their own with no special-casing
+// needed — e.g. Volume interrupts Mute (volumeReturnScreen = speakerMute
+// Screen); if Quick-jump then interrupts Volume too (quickJumpReturnScreen
+// = volumeScreen), each fuse firing only ever consults its OWN variable, so
+// unwinding the stack of interruptions naturally lands back on Mute at the
+// end, not stuck anywhere or bounced to the wrong place.
+lv_obj_t *volumeReturnScreen;
+lv_obj_t *speakerMuteReturnScreen;
+lv_obj_t *quickJumpReturnScreen;
+
+// Loads `target` and, if target is itself one of the three transient
+// screens, refreshes its own idle-fuse timer — otherwise re-landing on it
+// via another overlay's fuse would find a stale timer and immediately
+// bounce onward again instead of giving it a fresh window (e.g. you were
+// browsing Quick-jump, got interrupted by a Volume adjustment, and want a
+// full fresh look at the grid again once Volume settles, not an instant
+// second bounce).
+void restoreScreen(lv_obj_t *target) {
+  lv_screen_load(target);
+  uint32_t now = millis();
+  if (target == volumeScreen) lastVolumeActivityMs = now;
+  else if (target == speakerMuteScreen) lastSpeakerMuteActivityMs = now;
+  else if (target == quickJumpScreen) lastQuickJumpActivityMs = now;
+}
 
 // Same blue used for the ring, the "VOLUME" caption, and the icon — matches
 // the original UI mockup (https://claude.ai/code/artifact/659dd01a-d6ab-42d9-
@@ -360,7 +443,7 @@ void buildVolumeScreen(lv_obj_t *scr) {
 void showVolumeOverlay(int delta) {
   lv_obj_t *active = lv_screen_active();
   if (active != volumeScreen) {
-    previousScreen = active;
+    volumeReturnScreen = active;
     lv_screen_load(volumeScreen);
   }
   volumePercent = constrain(volumePercent + delta, 0, 100);
@@ -383,7 +466,7 @@ void showVolumeOverlay(int delta) {
 // it's reached the same way Volume is, via a global hardware input).
 constexpr uint32_t SPEAKER_MUTE_ACCENT_COLOR = 0xF0555F; // same red as the mockup's Mic card
 bool speakerMuted = false; // local estimate only — HID mute is a toggle with no readback
-uint32_t lastSpeakerMuteActivityMs = 0;
+// lastSpeakerMuteActivityMs itself is declared up near lastVolumeActivityMs — see comment there.
 
 // Speaker-muted icon (src/img_speaker_muted.c) — the same FA5 "volume-mute"
 // cone as LV_SYMBOL_MUTE, but with a diagonal slash baked directly into the
@@ -399,21 +482,52 @@ uint32_t lastSpeakerMuteActivityMs = 0;
 // wave-tier icons.
 extern const lv_image_dsc_t img_speaker_muted;
 
-lv_obj_t *speakerMuteScreen;
+// speakerMuteScreen itself is declared up near volumeScreen — see comment there.
 lv_obj_t *speakerMuteArc;
 lv_obj_t *speakerMuteIcon;     // img_speaker_muted, shown only when muted
 lv_obj_t *speakerMuteWaveIcon; // same img_volume_wave1/2/3 as Volume, shown when not muted
 lv_obj_t *speakerMuteLabel;
+// Pulsing ring shown only while muted (2026-08-07, Brian: "is it possible to
+// make the red ring pulse when muted?") — deliberately a plain bordered
+// circle (lv_obj), NOT an animated lv_arc. This project has an established,
+// hard-won finding that lv_arc redrawn repeatedly for decorative purposes is
+// unsafe on this display (see PROGRESS.md's icon-as-bitmap session — two
+// separate small-decorative-arc attempts both produced tearing, even with
+// LV_DISPLAY_RENDER_MODE_FULL already in place). A pulse is a repeated
+// redraw at animation frame rate, so this avoids that risk entirely by only
+// ever animating a plain object's border opacity, never touching lv_arc.
+// Since a pulsing ring is always a *full* circle (never a partial sweep),
+// a plain bordered circle looks identical to speakerMuteArc at value=100
+// anyway — no capability is lost by not using lv_arc here.
+lv_obj_t *speakerMuteRingPulse;
+
+void speakerMutePulseAnimCb(void *obj, int32_t value) {
+  lv_obj_set_style_border_opa((lv_obj_t *)obj, (lv_opa_t)value, 0);
+}
 
 void updateSpeakerMuteScreen() {
-  lv_arc_set_value(speakerMuteArc, speakerMuted ? 100 : 0);
+  // speakerMuteArc itself stays at the dim, near-invisible track look
+  // (value 0) always now — speakerMuteRingPulse owns the "muted" visual.
   lv_label_set_text(speakerMuteLabel, speakerMuted ? "MUTED" : "LIVE");
   if (speakerMuted) {
     lv_obj_remove_flag(speakerMuteIcon, LV_OBJ_FLAG_HIDDEN);
     lv_obj_add_flag(speakerMuteWaveIcon, LV_OBJ_FLAG_HIDDEN);
+    lv_obj_remove_flag(speakerMuteRingPulse, LV_OBJ_FLAG_HIDDEN);
+    lv_anim_t a;
+    lv_anim_init(&a);
+    lv_anim_set_var(&a, speakerMuteRingPulse);
+    lv_anim_set_exec_cb(&a, speakerMutePulseAnimCb);
+    lv_anim_set_values(&a, LV_OPA_30, LV_OPA_COVER);
+    lv_anim_set_time(&a, 900);
+    lv_anim_set_playback_time(&a, 900); // fade back down, not a hard cut
+    lv_anim_set_repeat_count(&a, LV_ANIM_REPEAT_INFINITE);
+    lv_anim_set_path_cb(&a, lv_anim_path_ease_in_out);
+    lv_anim_start(&a);
   } else {
     lv_obj_add_flag(speakerMuteIcon, LV_OBJ_FLAG_HIDDEN);
     lv_obj_remove_flag(speakerMuteWaveIcon, LV_OBJ_FLAG_HIDDEN);
+    lv_anim_delete(speakerMuteRingPulse, speakerMutePulseAnimCb);
+    lv_obj_add_flag(speakerMuteRingPulse, LV_OBJ_FLAG_HIDDEN);
     // Same tier count as the Volume screen (Brian: "let the number of
     // speaker arcs correspond with the number of speaker arcs on the volume
     // page") — both read from the same shared `volumePercent`.
@@ -432,6 +546,21 @@ void buildSpeakerMuteScreen(lv_obj_t *scr) {
   // Same ring/caption/icon sizing as Volume for visual consistency between
   // the two globally-triggered overlay screens.
   speakerMuteArc = makeRingGauge(scr, 350, 32, lv_color_hex(SPEAKER_MUTE_ACCENT_COLOR));
+
+  // Plain bordered circle, same outer diameter/thickness as speakerMuteArc
+  // above — see its declaration's comment for why this isn't an lv_arc.
+  // Hidden until muted; updateSpeakerMuteScreen() drives the pulse.
+  speakerMuteRingPulse = lv_obj_create(scr);
+  lv_obj_remove_flag(speakerMuteRingPulse, LV_OBJ_FLAG_SCROLLABLE);
+  lv_obj_remove_flag(speakerMuteRingPulse, LV_OBJ_FLAG_CLICKABLE);
+  lv_obj_set_size(speakerMuteRingPulse, 350, 350);
+  lv_obj_center(speakerMuteRingPulse);
+  lv_obj_set_style_radius(speakerMuteRingPulse, LV_RADIUS_CIRCLE, 0);
+  lv_obj_set_style_bg_opa(speakerMuteRingPulse, LV_OPA_TRANSP, 0); // ring only, no fill
+  lv_obj_set_style_border_width(speakerMuteRingPulse, 32, 0);
+  lv_obj_set_style_border_color(speakerMuteRingPulse, lv_color_hex(SPEAKER_MUTE_ACCENT_COLOR), 0);
+  lv_obj_set_style_pad_all(speakerMuteRingPulse, 0, 0);
+  lv_obj_add_flag(speakerMuteRingPulse, LV_OBJ_FLAG_HIDDEN);
 
   lv_obj_t *caption = lv_label_create(scr);
   lv_obj_set_style_text_font(caption, &lv_font_montserrat_22, 0);
@@ -468,7 +597,7 @@ void buildSpeakerMuteScreen(lv_obj_t *scr) {
 void showSpeakerMuteOverlay() {
   lv_obj_t *active = lv_screen_active();
   if (active != speakerMuteScreen) {
-    previousScreen = active;
+    speakerMuteReturnScreen = active;
     lv_screen_load(speakerMuteScreen);
   }
   speakerMuted = !speakerMuted;
@@ -494,8 +623,7 @@ constexpr uint32_t QUICK_JUMP_NOW_PLAYING_COLOR = 0x4FB477; // same green as the
 // and choose from, not a transient nudge like Volume/Speaker Mute.
 constexpr uint32_t QUICK_JUMP_RETURN_MS = 8000;
 
-lv_obj_t *quickJumpScreen;
-uint32_t lastQuickJumpActivityMs = 0;
+// quickJumpScreen and lastQuickJumpActivityMs are declared up near volumeScreen — see comment there.
 
 // One circular "spot": dark filled circle, colored border, colored icon
 // centered inside — mirrors the mockup's `.menu-spot` styling. Pass either
@@ -582,17 +710,10 @@ void buildQuickJumpScreen(lv_obj_t *scr) {
 // remember-previous-screen pattern. Swiping up from Volume was originally
 // excluded by design (rotate-only), but Brian asked for it directly
 // (2026-08-06: "It doesn't work from the volume page, though. It should.").
-// One accepted edge case from allowing this: if quick-jump's own idle fuse
-// later restores previousScreen == volumeScreen, Volume's own fuse-check
-// (loop()) will immediately re-fire on its own stale timer — but by then
-// previousScreen has already been overwritten to volumeScreen too, so it
-// just reloads the same screen rather than looping. Same shared-global
-// tradeoff already accepted between Volume and Speaker Mute elsewhere in
-// this file.
 void showQuickJumpMenu() {
   lv_obj_t *active = lv_screen_active();
   if (active == quickJumpScreen) return;
-  previousScreen = active;
+  quickJumpReturnScreen = active;
   lv_screen_load(quickJumpScreen);
   lastQuickJumpActivityMs = millis();
 }
@@ -713,7 +834,9 @@ void setupLVGL() {
   makeGestureBubbleThrough(volumeScreen);
   makeGestureBubbleThrough(speakerMuteScreen);
 
-  previousScreen = homeScreen;
+  volumeReturnScreen = homeScreen;
+  speakerMuteReturnScreen = homeScreen;
+  quickJumpReturnScreen = homeScreen;
   lv_screen_load(homeScreen);
 
   Serial.println("LVGL init OK");
@@ -749,11 +872,29 @@ void setupOTA() {
   Serial.println("OTA ready");
 }
 
+// Debug console over WiFi (http://<device-ip>/webserial) — added 2026-08-07
+// so runtime logging doesn't need a USB cable, same reasoning as OTA: once
+// this board lives permanently on Brian's desktop, this session has no
+// physical/serial access to it at all (see PROGRESS.md's quick-jump/swipe
+// session for how much that hurt debugging touch behavior earlier).
+// Needs WiFi already up, so only called from setup() after setupOTA() — same
+// "no WiFi, no OTA" graceful-degradation shape as that function.
+AsyncWebServer webServer(80);
+
+void setupWebSerial() {
+  if (WiFi.status() != WL_CONNECTED) return; // no WiFi, no WebSerial — same as OTA
+  WebSerial.begin(&webServer);
+  WebSerial.onMessage([](const String &msg) { Serial.printf("WebSerial recv: %s\n", msg.c_str()); });
+  webServer.begin();
+  Serial.println("WebSerial ready at /webserial");
+}
+
 void setup() {
   Serial.begin(115200);
   pinMode(PIN_ENCODER_A, INPUT_PULLUP);
   pinMode(PIN_ENCODER_B, INPUT_PULLUP);
   pinMode(PIN_ENCODER_KEY, INPUT_PULLUP);
+  attachInterrupt(digitalPinToInterrupt(PIN_ENCODER_A), encoderIsr, CHANGE);
 
   ConsumerControl.begin();
   USB.begin();
@@ -762,18 +903,18 @@ void setup() {
   setupTouch();
   setupLVGL();
   setupOTA();
+  setupWebSerial();
 
   Serial.println("T-Encoder Pro: HID volume/mute ready");
 }
 
 void loop() {
-  static int lastA = HIGH;
   static int lastKey = HIGH;
-  static uint32_t lastStepMs = 0;
   static uint32_t lastKeyMs = 0;
   static uint32_t lastStatusMs = 0;
 
   ArduinoOTA.handle();
+  WebSerial.loop();
 
   // LVGL now owns touch reads (via lvTouchpadRead(), called through this) —
   // no separate manual touch-print block needed anymore.
@@ -792,35 +933,43 @@ void loop() {
                    displayOk ? "ok" : "FAIL",
                    touchOk ? "ok" : "FAIL",
                    WiFi.status() == WL_CONNECTED ? WiFi.localIP().toString().c_str() : "-");
+    WebSerial.printf("status: wifi=%s display=%s touch=%s ip=%s\n",
+                      WiFi.status() == WL_CONNECTED ? "up" : "down",
+                      displayOk ? "ok" : "FAIL",
+                      touchOk ? "ok" : "FAIL",
+                      WiFi.status() == WL_CONNECTED ? WiFi.localIP().toString().c_str() : "-");
   }
 
-  int a = digitalRead(PIN_ENCODER_A);
-  if (a != lastA) {
-    lastA = a;
-    uint32_t now = millis();
-    // Direction from B's state on A's falling edge. If this reads backwards
-    // on the real hardware, just swap the two branches below.
-    if (a == LOW && (now - lastStepMs) > DEBOUNCE_MS) {
-      lastStepMs = now;
-      if (digitalRead(PIN_ENCODER_B) == HIGH) {
-        ConsumerControl.press(CONSUMER_CONTROL_VOLUME_INCREMENT);
-        ConsumerControl.release();
-        showVolumeOverlay(VOLUME_STEP);
-        Serial.println("VOL_UP");
-      } else {
-        ConsumerControl.press(CONSUMER_CONTROL_VOLUME_DECREMENT);
-        ConsumerControl.release();
-        showVolumeOverlay(-VOLUME_STEP);
-        Serial.println("VOL_DOWN");
-      }
-    }
+  // Drain whatever encoderIsr() has accumulated since the last iteration —
+  // see its comment (near the top of this file) for why reading happens via
+  // interrupt now instead of polling here. One HID pulse + overlay update
+  // per real detent, same as before, just sourced from the ISR's count
+  // instead of a fresh digitalRead() each time.
+  int32_t steps;
+  portENTER_CRITICAL(&encoderMux);
+  steps = encoderStepAccum;
+  encoderStepAccum = 0;
+  portEXIT_CRITICAL(&encoderMux);
+  while (steps > 0) {
+    ConsumerControl.press(CONSUMER_CONTROL_VOLUME_INCREMENT);
+    ConsumerControl.release();
+    showVolumeOverlay(VOLUME_STEP);
+    Serial.println("VOL_UP");
+    WebSerial.println("VOL_UP");
+    steps--;
+  }
+  while (steps < 0) {
+    ConsumerControl.press(CONSUMER_CONTROL_VOLUME_DECREMENT);
+    ConsumerControl.release();
+    showVolumeOverlay(-VOLUME_STEP);
+    Serial.println("VOL_DOWN");
+    WebSerial.println("VOL_DOWN");
+    steps++;
   }
 
   // 5s-after-last-turn fuse: restore whatever screen Volume interrupted.
   if (lv_screen_active() == volumeScreen && (millis() - lastVolumeActivityMs) > OVERLAY_RETURN_MS) {
-    lv_obj_t *restoring = previousScreen;
-    lv_screen_load(restoring);
-    if (restoring == quickJumpScreen) lastQuickJumpActivityMs = millis();
+    restoreScreen(volumeReturnScreen);
   }
   // Same fuse for Speaker Mute, but only while *not* muted (Brian: "when
   // muted, it should not [return] to the main screen... only return after
@@ -830,14 +979,12 @@ void loop() {
   // resets on every button press, so unmuting gets its own fresh 5s window).
   if (lv_screen_active() == speakerMuteScreen && !speakerMuted &&
       (millis() - lastSpeakerMuteActivityMs) > OVERLAY_RETURN_MS) {
-    lv_obj_t *restoring = previousScreen;
-    lv_screen_load(restoring);
-    if (restoring == quickJumpScreen) lastQuickJumpActivityMs = millis();
+    restoreScreen(speakerMuteReturnScreen);
   }
   // Quick-jump's own, longer idle fuse: walked away without tapping
   // anything, restore whatever screen it was opened from.
   if (lv_screen_active() == quickJumpScreen && (millis() - lastQuickJumpActivityMs) > QUICK_JUMP_RETURN_MS) {
-    lv_screen_load(previousScreen);
+    restoreScreen(quickJumpReturnScreen);
   }
 
   int key = digitalRead(PIN_ENCODER_KEY);
@@ -848,6 +995,7 @@ void loop() {
       lastKeyMs = now;
       showSpeakerMuteOverlay(); // sends the HID mute pulse itself
       Serial.println("MUTE");
+      WebSerial.println("MUTE");
     }
   }
 
