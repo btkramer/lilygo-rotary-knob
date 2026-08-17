@@ -607,6 +607,149 @@ void showSpeakerMuteOverlay() {
   lastSpeakerMuteActivityMs = millis();
 }
 
+// Now Playing: the last of the original 5-screen scope (2026-08-17). Unlike
+// Volume/Speaker Mute, this is a normal swipeable screen, not a global-input
+// overlay — reached via its Quick-jump spot or swipe left/right from Home,
+// and returns to Home on the standard 30s idle timeout (see
+// NOW_PLAYING_IDLE_MS below) rather than an overlay-style "restore whatever
+// it interrupted" fuse.
+//
+// Play/pause and prev/next are real USB HID (CONSUMER_CONTROL_PLAY_PAUSE /
+// SCAN_NEXT / SCAN_PREVIOUS) — work today with zero companion-app dependency,
+// same HID-first guarantee as Volume/Mute. Track title/artist/elapsed/
+// progress are placeholders (no companion app yet to report real now-playing
+// state — see PROGRESS.md's "Next" list), matching Home's CPU/GPU/RAM and
+// Volume's "SPEAKERS" device-name placeholders. Values match the original
+// mockup (https://claude.ai/code/artifact/659dd01a-d6ab-42d9-8998-
+// 5f99360b04ad) exactly, same as every other screen's placeholder data.
+constexpr uint32_t NOW_PLAYING_ACCENT_COLOR = 0x4FB477; // same green as the mockup's Now Playing card
+constexpr uint32_t NOW_PLAYING_IDLE_MS = 30000;         // standard non-Home idle timeout, see PROGRESS.md
+const char *nowPlayingArtist = "Boards of Canada";
+const char *nowPlayingTrack = "Roygbiv";
+const char *nowPlayingElapsed = "1:42";
+int nowPlayingProgressPercent = 38;
+// No HID readback exists for actual playback state — this is a local guess,
+// toggled optimistically on each play/pause tap, same "local estimate only"
+// pattern as volumePercent/speakerMuted. Icon shows the action a tap will
+// perform next (pause glyph while assumed playing), the standard media-
+// player convention — deliberately different from Speaker Mute's
+// icon-shows-current-state convention, since transport controls are a
+// different, well-established UI vocabulary.
+bool nowPlayingIsPlaying = true;
+uint32_t lastNowPlayingActivityMs = 0;
+
+lv_obj_t *nowPlayingScreen; // declared here (not up with the other screens) since it's built later in file order
+lv_obj_t *nowPlayingArc;
+lv_obj_t *nowPlayingIcon;
+
+void updateNowPlayingScreen() {
+  lv_arc_set_value(nowPlayingArc, nowPlayingProgressPercent);
+  lv_label_set_text(nowPlayingIcon, nowPlayingIsPlaying ? LV_SYMBOL_PAUSE : LV_SYMBOL_PLAY);
+}
+
+void nowPlayingPrevCb(lv_event_t *e) {
+  ConsumerControl.press(CONSUMER_CONTROL_SCAN_PREVIOUS);
+  ConsumerControl.release();
+  lastNowPlayingActivityMs = millis();
+  Serial.println("MEDIA_PREV");
+  WebSerial.println("MEDIA_PREV");
+}
+
+void nowPlayingNextCb(lv_event_t *e) {
+  ConsumerControl.press(CONSUMER_CONTROL_SCAN_NEXT);
+  ConsumerControl.release();
+  lastNowPlayingActivityMs = millis();
+  Serial.println("MEDIA_NEXT");
+  WebSerial.println("MEDIA_NEXT");
+}
+
+void nowPlayingPlayPauseCb(lv_event_t *e) {
+  ConsumerControl.press(CONSUMER_CONTROL_PLAY_PAUSE);
+  ConsumerControl.release();
+  nowPlayingIsPlaying = !nowPlayingIsPlaying;
+  updateNowPlayingScreen();
+  lastNowPlayingActivityMs = millis();
+  Serial.println("MEDIA_PLAY_PAUSE");
+  WebSerial.println("MEDIA_PLAY_PAUSE");
+}
+
+// Three invisible full-height tap zones (left/center/right thirds) — matches
+// the mockup's "Click: play/pause, Tap L/R: previous/next" caption. Added
+// after the rest of the screen's content so they sit on top in z-order;
+// doesn't actually matter here since nothing else on this screen is
+// clickable, but keeps click delivery unambiguous. No explicit
+// LV_OBJ_FLAG_GESTURE_BUBBLE needed — swipe left/right is caught at the
+// indev level (see screenCycleGestureCb below), same proven-working approach
+// as Quick-jump's swipe-up, so per-child bubbling isn't load-bearing here.
+lv_obj_t *makeNowPlayingTapZone(lv_obj_t *parent, int16_t x, int16_t w) {
+  lv_obj_t *zone = lv_obj_create(parent);
+  lv_obj_remove_flag(zone, LV_OBJ_FLAG_SCROLLABLE);
+  lv_obj_set_style_bg_opa(zone, LV_OPA_TRANSP, 0);
+  lv_obj_set_style_border_width(zone, 0, 0);
+  lv_obj_set_style_pad_all(zone, 0, 0);
+  lv_obj_set_size(zone, w, SCREEN_HEIGHT);
+  lv_obj_set_pos(zone, x, 0);
+  return zone;
+}
+
+void addNowPlayingTapZones(lv_obj_t *scr) {
+  constexpr int16_t ZONE_W = SCREEN_WIDTH / 3;
+  lv_obj_t *prevZone = makeNowPlayingTapZone(scr, 0, ZONE_W);
+  lv_obj_add_event_cb(prevZone, nowPlayingPrevCb, LV_EVENT_CLICKED, NULL);
+  lv_obj_t *playPauseZone = makeNowPlayingTapZone(scr, ZONE_W, ZONE_W);
+  lv_obj_add_event_cb(playPauseZone, nowPlayingPlayPauseCb, LV_EVENT_CLICKED, NULL);
+  lv_obj_t *nextZone = makeNowPlayingTapZone(scr, ZONE_W * 2, SCREEN_WIDTH - ZONE_W * 2);
+  lv_obj_add_event_cb(nextZone, nowPlayingNextCb, LV_EVENT_CLICKED, NULL);
+}
+
+void buildNowPlayingScreen(lv_obj_t *scr) {
+  lv_obj_set_style_bg_color(scr, lv_color_black(), 0);
+  lv_obj_set_style_bg_opa(scr, LV_OPA_COVER, 0);
+  lv_obj_remove_flag(scr, LV_OBJ_FLAG_SCROLLABLE);
+
+  // Same ring size as Volume/Speaker Mute for visual consistency across
+  // every screen that centers one accent-colored ring.
+  nowPlayingArc = makeRingGauge(scr, 350, 32, lv_color_hex(NOW_PLAYING_ACCENT_COLOR));
+
+  lv_obj_t *caption = lv_label_create(scr);
+  lv_obj_set_style_text_font(caption, &lv_font_montserrat_22, 0);
+  lv_obj_set_style_text_color(caption, lv_color_hex(NOW_PLAYING_ACCENT_COLOR), 0);
+  lv_label_set_text(caption, "MEDIA");
+  lv_obj_align(caption, LV_ALIGN_CENTER, 0, -95);
+
+  nowPlayingIcon = lv_label_create(scr);
+  lv_obj_set_style_text_font(nowPlayingIcon, &lv_font_montserrat_42, 0);
+  lv_obj_set_style_text_color(nowPlayingIcon, lv_color_hex(NOW_PLAYING_ACCENT_COLOR), 0);
+  lv_obj_align(nowPlayingIcon, LV_ALIGN_CENTER, 0, -50);
+
+  // Artist (brighter) above track+elapsed (muted) — matches the mockup's
+  // exact two-line ordering, re-checked directly against the fetched
+  // artifact rather than guessed (this project's standing lesson).
+  lv_obj_t *artistLabel = lv_label_create(scr);
+  lv_obj_set_style_text_font(artistLabel, &lv_font_montserrat_22, 0);
+  lv_obj_set_style_text_color(artistLabel, lv_color_hex(0xE7ECE9), 0);
+  lv_label_set_text(artistLabel, nowPlayingArtist);
+  lv_obj_align(artistLabel, LV_ALIGN_CENTER, 0, 5);
+
+  lv_obj_t *trackLabel = lv_label_create(scr);
+  lv_obj_set_style_text_font(trackLabel, &lv_font_montserrat_14, 0);
+  lv_obj_set_style_text_color(trackLabel, lv_color_hex(0x9AA5A3), 0);
+  lv_label_set_text_fmt(trackLabel, "%s \xC2\xB7 %s", nowPlayingTrack, nowPlayingElapsed); // \xC2\xB7 = UTF-8 middle dot
+  lv_obj_align(trackLabel, LV_ALIGN_CENTER, 0, 34);
+
+  addNowPlayingTapZones(scr);
+  updateNowPlayingScreen();
+}
+
+// Entry point for Now Playing (Quick-jump spot, swipe left/right) — mirrors
+// showQuickJumpMenu()'s shape but with no return-screen memory needed, since
+// this screen always falls back to Home on idle, never to "whatever it
+// interrupted" (it's not an overlay).
+void showNowPlayingScreen() {
+  lv_screen_load(nowPlayingScreen);
+  lastNowPlayingActivityMs = millis();
+}
+
 // Quick-jump grid: the only way to jump straight to a screen out of the
 // normal swipe/rotate order (see PROGRESS.md's design decisions — "Swipe up
 // = quick-jump grid, the only way to open it"). Layout matches the original
@@ -693,16 +836,16 @@ void buildQuickJumpScreen(lv_obj_t *scr) {
   // bitmap regardless of live speakerMuted state, always showing "muted"
   // even when live. Not worth fixing for a spot that wasn't earning its
   // place anyway.
-  // Now Playing doesn't exist yet — dimmed and non-interactive, but kept
-  // in place so it's ready to wire up once that screen is built (see
-  // PROGRESS.md's "Next" list). Moved to bottom-center (was bottom-right,
-  // mirroring the mockup's 3-spot layout) now that Speaker Mute's bottom-
-  // left spot is gone — centering it under Home reads better with only two
-  // spots than leaving it off to one side with an empty gap opposite it.
+  // Now Playing spot, wired up (2026-08-17) now that screen exists. Moved to
+  // bottom-center (was bottom-right, mirroring the mockup's 3-spot layout)
+  // now that Speaker Mute's bottom-left spot is gone — centering it under
+  // Home reads better with only two spots than leaving it off to one side
+  // with an empty gap opposite it. Uses its own click cb (not the generic
+  // quickJumpSpotClickedCb every other spot uses) since entering Now Playing
+  // also needs to start its own idle-timeout fuse — see showNowPlayingScreen().
   lv_obj_t *nowPlayingSpot =
       makeQuickJumpSpot(scr, 0, 100, lv_color_hex(QUICK_JUMP_NOW_PLAYING_COLOR), LV_SYMBOL_PLAY, nullptr);
-  lv_obj_remove_flag(nowPlayingSpot, LV_OBJ_FLAG_CLICKABLE);
-  lv_obj_set_style_opa(nowPlayingSpot, LV_OPA_40, 0);
+  lv_obj_add_event_cb(nowPlayingSpot, [](lv_event_t *e) { showNowPlayingScreen(); }, LV_EVENT_CLICKED, NULL);
 }
 
 // Called on a detected swipe-up gesture, from Home, Volume, or Speaker Mute
@@ -755,6 +898,29 @@ void quickJumpGestureCb(lv_event_t *e) {
   lv_obj_t *active = lv_screen_active();
   if (dir == LV_DIR_TOP && (active == homeScreen || active == volumeScreen || active == speakerMuteScreen)) {
     showQuickJumpMenu();
+  }
+}
+
+// Swipe left/right toggles between Home and Now Playing — the only two
+// "normal" (non-overlay) screens today, so a straight toggle is complete and
+// correct (Brian confirmed 2026-08-17: Home participates in the cycle,
+// matching the original mockup's legend — "Swipe left/right: cycle screens,
+// Volume excluded" — nothing in it excludes Home). Volume and Speaker Mute
+// stay out of this, same reasoning as Quick-jump: they're transient
+// global-input overlays, not stops on the swipe ring. Extend to genuine
+// ordered N-way cycling once a third such screen exists — not worth the
+// abstraction for two. Subscribed on the indev directly, same proven
+// approach as quickJumpGestureCb above.
+void screenCycleGestureCb(lv_event_t *e) {
+  lv_indev_t *indev = lv_indev_active();
+  if (!indev) return;
+  lv_dir_t dir = lv_indev_get_gesture_dir(indev);
+  if (dir != LV_DIR_LEFT && dir != LV_DIR_RIGHT) return;
+  lv_obj_t *active = lv_screen_active();
+  if (active == homeScreen) {
+    showNowPlayingScreen();
+  } else if (active == nowPlayingScreen) {
+    lv_screen_load(homeScreen);
   }
 }
 
@@ -821,6 +987,8 @@ void setupLVGL() {
   buildVolumeScreen(volumeScreen);
   speakerMuteScreen = lv_obj_create(NULL);
   buildSpeakerMuteScreen(speakerMuteScreen);
+  nowPlayingScreen = lv_obj_create(NULL);
+  buildNowPlayingScreen(nowPlayingScreen);
   quickJumpScreen = lv_obj_create(NULL);
   buildQuickJumpScreen(quickJumpScreen);
 
@@ -830,6 +998,10 @@ void setupLVGL() {
   // widget the bubble-up walk lands on). Screen filtering (Home/Speaker
   // Mute only, not Volume) happens inside the callback instead.
   lv_indev_add_event_cb(indev, quickJumpGestureCb, LV_EVENT_GESTURE, NULL);
+  // Swipe left/right entry point for the Home <-> Now Playing toggle — same
+  // indev-level subscription pattern, coexists fine with quickJumpGestureCb
+  // above since each only acts on its own gesture direction.
+  lv_indev_add_event_cb(indev, screenCycleGestureCb, LV_EVENT_GESTURE, NULL);
   makeGestureBubbleThrough(homeScreen); // still correct practice even though no longer load-bearing for this
   makeGestureBubbleThrough(volumeScreen);
   makeGestureBubbleThrough(speakerMuteScreen);
@@ -985,6 +1157,14 @@ void loop() {
   // anything, restore whatever screen it was opened from.
   if (lv_screen_active() == quickJumpScreen && (millis() - lastQuickJumpActivityMs) > QUICK_JUMP_RETURN_MS) {
     restoreScreen(quickJumpReturnScreen);
+  }
+  // Now Playing's idle fuse always falls back to Home directly — unlike the
+  // overlay screens above, it's not "restore whatever this interrupted"
+  // (see PROGRESS.md's design rules: the standard 30s-idle-to-Home rule for
+  // any non-Home screen, first real implementation of it since Now Playing
+  // is the first non-overlay non-Home screen to exist).
+  if (lv_screen_active() == nowPlayingScreen && (millis() - lastNowPlayingActivityMs) > NOW_PLAYING_IDLE_MS) {
+    lv_screen_load(homeScreen);
   }
 
   int key = digitalRead(PIN_ENCODER_KEY);
