@@ -665,7 +665,7 @@
 #define LV_FONT_MONTSERRAT_12 0
 #define LV_FONT_MONTSERRAT_14 1
 #define LV_FONT_MONTSERRAT_16 0
-#define LV_FONT_MONTSERRAT_18 0
+#define LV_FONT_MONTSERRAT_18 1  /* Now Playing track+elapsed line, bumped up from 14 (too small to read) */
 #define LV_FONT_MONTSERRAT_20 0
 #define LV_FONT_MONTSERRAT_22 1  /* Volume screen captions, bumped up from 18 */
 #define LV_FONT_MONTSERRAT_24 1  /* used for ring gauge percentage labels */

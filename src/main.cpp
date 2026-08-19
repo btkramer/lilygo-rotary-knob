@@ -12,6 +12,9 @@
 #include <AsyncTCP.h>
 #include <ESPAsyncWebServer.h>
 #include <WebSerial.h>
+#include <HTTPClient.h>
+#include <ArduinoJson.h>
+#include <Preferences.h>
 #include "USB.h"
 #include "USBHIDConsumerControl.h"
 #include "secrets.h"
@@ -107,6 +110,23 @@ float cpuTempC = 42;
 float gpuTempC = 54;
 float ramPercent = 61;
 
+// Whether pc-dash-app (the Windows companion, not built yet — see
+// PROGRESS.md's "Next" list) has reported in recently, per the Docker app
+// sync protocol's pcState.pcConnected. PC-dependent display data (these
+// rings, Now Playing's track info) shows a dimmed/offline treatment when
+// false instead of quietly showing stale numbers; PC-independent data
+// (clock, weather, lights, settings) is unaffected either way.
+bool pcConnected = false;
+uint32_t lastSeenSecondsAgo = 0;
+// Temporary testing override (Brian, 2026-08-19): pcConnected is always
+// false today since pc-dash-app doesn't exist yet, which makes the offline
+// dim treatment permanently active and everything hard to see while
+// iterating on this screen's own layout/legibility. Flip back to true once
+// there's a real PC to go offline from — pcConnected itself, the sync poll,
+// and NVS persistence are all untouched by this, only the *display* of the
+// dim treatment is suppressed.
+constexpr bool PC_OFFLINE_DIM_ENABLED = false;
+
 // LVGL owns its own draw buffer and rendering entirely — this replaces the
 // earlier direct-to-Arduino_GFX drawHomeScreen()/drawRingGauge() approach.
 // Two full-frame PSRAM buffers (LV_DISPLAY_RENDER_MODE_FULL), not a small
@@ -130,6 +150,7 @@ lv_color_t *lvDrawBuf2 = nullptr;
 
 lv_obj_t *cpuArc, *gpuArc, *ramArc;
 lv_obj_t *cpuLabel, *gpuLabel, *ramLabel;
+lv_obj_t *homeOfflineLabel;
 
 uint32_t lvMillisCb() { return millis(); }
 
@@ -232,6 +253,25 @@ void updateHomeScreen() {
   lv_label_set_text_fmt(cpuLabel, "CPU %d°", (int)cpuTempC);
   lv_label_set_text_fmt(gpuLabel, "GPU %d°", (int)gpuTempC);
   lv_label_set_text_fmt(ramLabel, "RAM %d%%", (int)ramPercent);
+
+  // PC-offline treatment (see pcConnected's own comment) — dim the rings
+  // rather than hide them, so the layout doesn't jump, plus a label making
+  // the "these numbers are stale/unavailable" state explicit. Gated on
+  // PC_OFFLINE_DIM_ENABLED (see its own comment) — suppressed for now so
+  // pcConnected's permanent false doesn't dim every screen during testing.
+  bool showConnected = pcConnected || !PC_OFFLINE_DIM_ENABLED;
+  lv_opa_t ringOpa = showConnected ? LV_OPA_COVER : LV_OPA_30;
+  lv_obj_set_style_arc_opa(cpuArc, ringOpa, LV_PART_INDICATOR);
+  lv_obj_set_style_arc_opa(gpuArc, ringOpa, LV_PART_INDICATOR);
+  lv_obj_set_style_arc_opa(ramArc, ringOpa, LV_PART_INDICATOR);
+  lv_obj_set_style_text_opa(cpuLabel, ringOpa, 0);
+  lv_obj_set_style_text_opa(gpuLabel, ringOpa, 0);
+  lv_obj_set_style_text_opa(ramLabel, ringOpa, 0);
+  if (showConnected) {
+    lv_obj_add_flag(homeOfflineLabel, LV_OBJ_FLAG_HIDDEN);
+  } else {
+    lv_obj_remove_flag(homeOfflineLabel, LV_OBJ_FLAG_HIDDEN);
+  }
 }
 
 void buildHomeScreen(lv_obj_t *scr) {
@@ -249,6 +289,13 @@ void buildHomeScreen(lv_obj_t *scr) {
   gpuLabel = makeRingLabel(scr, 0, lv_color_hex(0x0080FF));
   ramLabel = makeRingLabel(scr, 44, lv_color_hex(0x00C853));
 
+  homeOfflineLabel = lv_label_create(scr);
+  lv_obj_set_style_text_font(homeOfflineLabel, &lv_font_montserrat_14, 0);
+  lv_obj_set_style_text_color(homeOfflineLabel, lv_color_hex(0x9AA5A3), 0);
+  lv_label_set_text(homeOfflineLabel, "PC OFFLINE");
+  lv_obj_align(homeOfflineLabel, LV_ALIGN_BOTTOM_MID, 0, -20);
+  lv_obj_add_flag(homeOfflineLabel, LV_OBJ_FLAG_HIDDEN); // shown by updateHomeScreen() once pcConnected is known
+
   updateHomeScreen();
 }
 
@@ -264,8 +311,12 @@ constexpr int VOLUME_STEP = 2;
 // Shared by Volume and Speaker Mute — both are transient, globally-triggered
 // overlays (rotate / knob-press) that restore whatever they interrupted
 // after this long. Renamed from VOLUME_RETURN_MS (2026-08-06) once Speaker
-// Mute started using the same fuse.
-constexpr uint32_t OVERLAY_RETURN_MS = 5000;
+// Mute started using the same fuse. Operator-adjustable from the Docker app
+// (see "Docker app sync protocol" in ECOSYSTEM_PLAN.md) — mutable, not
+// constexpr, so a synced value can override this hardcoded default; the
+// default is what's used until NVS/a sync poll has ever supplied one.
+constexpr uint32_t VOLUME_FUSE_MS_DEFAULT = 5000;
+uint32_t volumeFuseMs = VOLUME_FUSE_MS_DEFAULT;
 int volumePercent = 50;
 uint32_t lastVolumeActivityMs = 0;
 // Declared together with lastVolumeActivityMs (rather than down where each
@@ -302,29 +353,44 @@ lv_obj_t *volumeMuteIcon; // LV_SYMBOL_MUTE label, shown only at 0%
 lv_obj_t *volumeWaveIcon; // single image widget, src swapped per tier
 lv_obj_t *volumeLabel;
 
-// Real bug, found and fixed twice (2026-08-07) before landing here. First
-// attempt: a single shared `previousScreen` variable, set by whichever of
-// Volume/Speaker Mute/Quick-jump was entered most recently. Broke two ways:
-// (1) entering one transient screen from another (e.g. pressing mute while
-// looking at Volume) could set previousScreen to a transient screen itself,
-// and once that screen's own fuse later fired using a stale previousScreen
-// still pointing at itself, it reloaded onto itself — a no-op that looked
-// exactly like "the timeout doesn't work". Fixed *that* by refusing to ever
-// store a transient screen as previousScreen — but that broke the actually
-// -correct case: Brian's real workflow (turn knob -> Volume; press mute ->
-// Speaker Mute; turn knob again -> Volume interrupts Mute; wait -> should
-// return to Mute, not Home) needs previousScreen to legitimately be able to
-// point at another transient screen, since that's genuinely what got
-// interrupted. The real fix: each transient screen gets its OWN dedicated
-// "what am I covering" variable instead of sharing one. This makes
-// interruption chains resolve correctly on their own with no special-casing
-// needed — e.g. Volume interrupts Mute (volumeReturnScreen = speakerMute
-// Screen); if Quick-jump then interrupts Volume too (quickJumpReturnScreen
-// = volumeScreen), each fuse firing only ever consults its OWN variable, so
-// unwinding the stack of interruptions naturally lands back on Mute at the
-// end, not stuck anywhere or bounced to the wrong place.
+// Real bug, found and fixed three times before landing here. First attempt
+// (2026-08-07): a single shared `previousScreen` variable, set by whichever
+// of Volume/Speaker Mute/Quick-jump was entered most recently. Broke two
+// ways: (1) entering one transient screen from another (e.g. pressing mute
+// while looking at Volume) could set previousScreen to a transient screen
+// itself, and once that screen's own fuse later fired using a stale
+// previousScreen still pointing at itself, it reloaded onto itself — a no-op
+// that looked exactly like "the timeout doesn't work". Fixed *that* by
+// refusing to ever store a transient screen as previousScreen — but that
+// broke the case where Speaker Mute genuinely needs to stay the eventual
+// landing spot while muted (see below). The second fix: each transient
+// screen gets its OWN dedicated "what am I covering" variable instead of
+// sharing one, allowing Volume/Mute to interrupt each other and unwind back
+// correctly — quickJumpReturnScreen follows the same pattern and is
+// unaffected by anything below (Quick-jump is a real, intentionally-browsed
+// menu, not a transient auto-triggered overlay like these two).
+//
+// Third fix (Brian, 2026-08-19): unconditional chaining between Volume and
+// Mute was itself wrong — turning the volume knob then unmuting (or vice
+// versa) visibly bounced through the *other* overlay for its own fuse
+// duration before finally reaching the real screen underneath, since each
+// treated "whatever's currently on screen" as a valid thing to return to
+// even when that was the other transient overlay. Volume is always purely
+// transient (never worth returning to for its own sake — see
+// showVolumeOverlay()), so Mute unconditionally skips straight past it.
+// Mute is different: while actively muted, it's Brian's own confirmed
+// deliberate-persistent-state design (`speakerMuted` — "should not return to
+// the main screen... only after unmuting"), so a Volume interruption started
+// *while still muted* still needs to land back on Mute afterward or the
+// mute indicator would vanish behind Home despite audio staying muted; only
+// skipped when not muted (an about-to-auto-dismiss moment, not a
+// deliberate state) — see showVolumeOverlay()'s own comment for exactly how.
 lv_obj_t *volumeReturnScreen;
 lv_obj_t *speakerMuteReturnScreen;
+// Declared here (not down by Speaker Mute's own screen code) since
+// showVolumeOverlay() below needs it in scope — local estimate only, HID
+// mute is a toggle with no readback.
+bool speakerMuted = false;
 lv_obj_t *quickJumpReturnScreen;
 
 // Loads `target` and, if target is itself one of the three transient
@@ -443,7 +509,13 @@ void buildVolumeScreen(lv_obj_t *scr) {
 void showVolumeOverlay(int delta) {
   lv_obj_t *active = lv_screen_active();
   if (active != volumeScreen) {
-    volumeReturnScreen = active;
+    // Skip straight past Mute if it's not actively muted right now — an
+    // unmuted Mute screen is just mid-flight back to whatever it covers
+    // anyway, not a real destination (see volumeReturnScreen's own comment).
+    // While actively muted, Mute stays the legitimate target so its
+    // indicator survives a volume bump instead of getting bounced behind it.
+    volumeReturnScreen =
+        (active == speakerMuteScreen && !speakerMuted) ? speakerMuteReturnScreen : active;
     lv_screen_load(volumeScreen);
   }
   volumePercent = constrain(volumePercent + delta, 0, 100);
@@ -465,7 +537,7 @@ void showVolumeOverlay(int delta) {
 // navigation reaching this screen first, which no longer applies now that
 // it's reached the same way Volume is, via a global hardware input).
 constexpr uint32_t SPEAKER_MUTE_ACCENT_COLOR = 0xF0555F; // same red as the mockup's Mic card
-bool speakerMuted = false; // local estimate only — HID mute is a toggle with no readback
+// speakerMuted itself is declared up near volumeReturnScreen (showVolumeOverlay() needs it in scope) — see comment there.
 // lastSpeakerMuteActivityMs itself is declared up near lastVolumeActivityMs — see comment there.
 
 // Speaker-muted icon (src/img_speaker_muted.c) — the same FA5 "volume-mute"
@@ -597,7 +669,10 @@ void buildSpeakerMuteScreen(lv_obj_t *scr) {
 void showSpeakerMuteOverlay() {
   lv_obj_t *active = lv_screen_active();
   if (active != speakerMuteScreen) {
-    speakerMuteReturnScreen = active;
+    // Volume is always purely transient (see volumeReturnScreen's own
+    // comment) — never a real destination, so skip straight past it
+    // unconditionally rather than chaining through it on the way back.
+    speakerMuteReturnScreen = (active == volumeScreen) ? volumeReturnScreen : active;
     lv_screen_load(speakerMuteScreen);
   }
   speakerMuted = !speakerMuted;
@@ -611,7 +686,7 @@ void showSpeakerMuteOverlay() {
 // Volume/Speaker Mute, this is a normal swipeable screen, not a global-input
 // overlay — reached via its Quick-jump spot or swipe left/right from Home,
 // and returns to Home on the standard 30s idle timeout (see
-// NOW_PLAYING_IDLE_MS below) rather than an overlay-style "restore whatever
+// idleToHomeMs below) rather than an overlay-style "restore whatever
 // it interrupted" fuse.
 //
 // Play/pause and prev/next are real USB HID (CONSUMER_CONTROL_PLAY_PAUSE /
@@ -623,10 +698,20 @@ void showSpeakerMuteOverlay() {
 // mockup (https://claude.ai/code/artifact/659dd01a-d6ab-42d9-8998-
 // 5f99360b04ad) exactly, same as every other screen's placeholder data.
 constexpr uint32_t NOW_PLAYING_ACCENT_COLOR = 0x4FB477; // same green as the mockup's Now Playing card
-constexpr uint32_t NOW_PLAYING_IDLE_MS = 30000;         // standard non-Home idle timeout, see PROGRESS.md
+// Operator-adjustable from the Docker app, same as volumeFuseMs above.
+constexpr uint32_t IDLE_TO_HOME_MS_DEFAULT = 30000; // standard non-Home idle timeout, see PROGRESS.md
+uint32_t idleToHomeMs = IDLE_TO_HOME_MS_DEFAULT;
 const char *nowPlayingArtist = "Boards of Canada";
 const char *nowPlayingTrack = "Roygbiv";
 const char *nowPlayingElapsed = "1:42";
+// Placeholder for the source app (Brian, 2026-08-19, e.g. "YouTube") —
+// SMTC exposes which app owns the active media session once pc-dash-app
+// exists (see ECOSYSTEM_PLAN.md's "YouTube-aware pause vs. mute" section);
+// per-app, not per-tab/site, so a browser tab may only ever show as the
+// browser itself unless the site's own Media Session metadata disambiguates
+// it further. Same "no companion app yet" placeholder pattern as artist/
+// track/elapsed above.
+const char *nowPlayingSource = "YouTube";
 int nowPlayingProgressPercent = 38;
 // No HID readback exists for actual playback state — this is a local guess,
 // toggled optimistically on each play/pause tap, same "local estimate only"
@@ -641,33 +726,134 @@ uint32_t lastNowPlayingActivityMs = 0;
 lv_obj_t *nowPlayingScreen; // declared here (not up with the other screens) since it's built later in file order
 lv_obj_t *nowPlayingArc;
 lv_obj_t *nowPlayingIcon;
+lv_obj_t *nowPlayingPrevIcon;
+lv_obj_t *nowPlayingNextIcon;
+lv_obj_t *nowPlayingSourceLabel;
+lv_obj_t *nowPlayingArtistLabel;
+lv_obj_t *nowPlayingTrackLabel;
+lv_obj_t *nowPlayingElapsedLabel;
+lv_obj_t *nowPlayingOfflineLabel;
+// Behind each transport icon — see nowPlayingPulseGlow's own comment.
+lv_obj_t *nowPlayingPrevGlow;
+lv_obj_t *nowPlayingPlayPauseGlow;
+lv_obj_t *nowPlayingNextGlow;
 
 void updateNowPlayingScreen() {
   lv_arc_set_value(nowPlayingArc, nowPlayingProgressPercent);
   lv_label_set_text(nowPlayingIcon, nowPlayingIsPlaying ? LV_SYMBOL_PAUSE : LV_SYMBOL_PLAY);
+
+  // Same PC-offline dim treatment as Home (see pcConnected's own comment and
+  // PC_OFFLINE_DIM_ENABLED, currently suppressing it for testing) —
+  // track/artist/progress are all PC-sourced, transport controls (HID) keep
+  // working regardless since they don't depend on this channel.
+  bool showConnected = pcConnected || !PC_OFFLINE_DIM_ENABLED;
+  lv_opa_t opa = showConnected ? LV_OPA_COVER : LV_OPA_30;
+  lv_obj_set_style_arc_opa(nowPlayingArc, opa, LV_PART_INDICATOR);
+  lv_obj_set_style_text_opa(nowPlayingSourceLabel, opa, 0);
+  lv_obj_set_style_text_opa(nowPlayingArtistLabel, opa, 0);
+  lv_obj_set_style_text_opa(nowPlayingTrackLabel, opa, 0);
+  lv_obj_set_style_text_opa(nowPlayingElapsedLabel, opa, 0);
+  if (showConnected) {
+    lv_obj_add_flag(nowPlayingOfflineLabel, LV_OBJ_FLAG_HIDDEN);
+  } else {
+    lv_obj_remove_flag(nowPlayingOfflineLabel, LV_OBJ_FLAG_HIDDEN);
+  }
+}
+
+void nowPlayingGlowAnimCb(void *obj, int32_t value) {
+  lv_obj_set_style_bg_opa((lv_obj_t *)obj, (lv_opa_t)value, 0);
+}
+
+// A plain circle behind a transport icon, opacity-animated — same safe
+// "plain object, never an arc" pattern as speakerMuteRingPulse (see its own
+// comment: small decorative arcs produced tearing here even under
+// LV_DISPLAY_RENDER_MODE_FULL). Starts fully transparent; nowPlayingPulseGlow
+// below is what actually flashes it.
+lv_obj_t *makeNowPlayingGlow(lv_obj_t *parent, int16_t xOffset, int16_t yOffset, int16_t diameter) {
+  lv_obj_t *glow = lv_obj_create(parent);
+  lv_obj_remove_flag(glow, LV_OBJ_FLAG_SCROLLABLE);
+  lv_obj_remove_flag(glow, LV_OBJ_FLAG_CLICKABLE); // purely decorative — the tap zones on top own all input here
+  lv_obj_set_size(glow, diameter, diameter);
+  lv_obj_set_style_radius(glow, LV_RADIUS_CIRCLE, 0);
+  lv_obj_set_style_border_width(glow, 0, 0);
+  lv_obj_set_style_bg_color(glow, lv_color_hex(NOW_PLAYING_ACCENT_COLOR), 0);
+  lv_obj_set_style_bg_opa(glow, LV_OPA_TRANSP, 0);
+  lv_obj_align(glow, LV_ALIGN_CENTER, xOffset, yOffset);
+  return glow;
+}
+
+// Brief glow flash behind a transport icon on tap — visual confirmation the
+// tap registered (Brian, 2026-08-19: wanted "some indication that one was
+// tapped, like a soft pulse glow"). Prev/Next especially have no persistent
+// on-screen state to change on tap the way Play/Pause's own icon swaps —
+// HID has no readback for "did skip actually happen" — so without this a
+// prev/next tap gave zero visible feedback at all. One-shot pulse, not a
+// loop — a momentary acknowledgment, unlike speakerMuteRingPulse's infinite
+// pulse for an ongoing persistent state.
+//
+// Fades *in* then out (not an instant jump to peak opacity) — the first cut
+// of this jumped straight to LV_OPA_60 and only animated the fade-down,
+// which read as choppy (Brian, 2026-08-19). A real pulse ramps both ways;
+// fade-in is quicker than fade-out so the glow still reads as an immediate
+// response to the tap, not a delayed one, while the exit stays slow and
+// soft.
+void nowPlayingPulseGlow(lv_obj_t *glow) {
+  lv_anim_delete(glow, nowPlayingGlowAnimCb); // retapping mid-pulse restarts cleanly instead of stacking anims
+  lv_anim_t a;
+  lv_anim_init(&a);
+  lv_anim_set_var(&a, glow);
+  lv_anim_set_exec_cb(&a, nowPlayingGlowAnimCb);
+  lv_anim_set_values(&a, LV_OPA_TRANSP, LV_OPA_60);
+  lv_anim_set_time(&a, 220);            // fade in
+  lv_anim_set_playback_time(&a, 700);   // fade back out — slower than the fade-in, a soft glow rather than a flash
+  lv_anim_set_repeat_count(&a, 1);      // one-shot, not a loop (LV_ANIM_REPEAT_INFINITE is speakerMuteRingPulse's job)
+  lv_anim_set_path_cb(&a, lv_anim_path_ease_in_out);
+  lv_anim_start(&a);
+}
+
+// LVGL still fires LV_EVENT_CLICKED on release even when the touch was
+// actually a swipe, since the tap zones are deliberately non-scrollable
+// (see makeNowPlayingTapZone's own comment) — LVGL only withholds CLICKED
+// when something actually scrolled in response to the drag (lv_indev.c:
+// `if (scroll_obj == NULL) { ... send CLICKED }`), and nothing here ever
+// scrolls. Swiping up to Quick-jump from this screen (added 2026-08-19) was
+// firing a spurious play/pause/prev/next underneath it as a result. Gesture
+// direction is set mid-drag, before release (lv_indev.c's indev_gesture(),
+// called every read while pressed) and stays set through the release that
+// fires CLICKED, so checking it here reliably tells a real tap apart from a
+// swipe that happened to start on one of these zones.
+bool nowPlayingTapWasGesture() {
+  lv_indev_t *indev = lv_indev_active();
+  return indev && lv_indev_get_gesture_dir(indev) != LV_DIR_NONE;
 }
 
 void nowPlayingPrevCb(lv_event_t *e) {
+  if (nowPlayingTapWasGesture()) return;
   ConsumerControl.press(CONSUMER_CONTROL_SCAN_PREVIOUS);
   ConsumerControl.release();
+  nowPlayingPulseGlow(nowPlayingPrevGlow);
   lastNowPlayingActivityMs = millis();
   Serial.println("MEDIA_PREV");
   WebSerial.println("MEDIA_PREV");
 }
 
 void nowPlayingNextCb(lv_event_t *e) {
+  if (nowPlayingTapWasGesture()) return;
   ConsumerControl.press(CONSUMER_CONTROL_SCAN_NEXT);
   ConsumerControl.release();
+  nowPlayingPulseGlow(nowPlayingNextGlow);
   lastNowPlayingActivityMs = millis();
   Serial.println("MEDIA_NEXT");
   WebSerial.println("MEDIA_NEXT");
 }
 
 void nowPlayingPlayPauseCb(lv_event_t *e) {
+  if (nowPlayingTapWasGesture()) return;
   ConsumerControl.press(CONSUMER_CONTROL_PLAY_PAUSE);
   ConsumerControl.release();
   nowPlayingIsPlaying = !nowPlayingIsPlaying;
   updateNowPlayingScreen();
+  nowPlayingPulseGlow(nowPlayingPlayPauseGlow);
   lastNowPlayingActivityMs = millis();
   Serial.println("MEDIA_PLAY_PAUSE");
   WebSerial.println("MEDIA_PLAY_PAUSE");
@@ -711,31 +897,96 @@ void buildNowPlayingScreen(lv_obj_t *scr) {
   // every screen that centers one accent-colored ring.
   nowPlayingArc = makeRingGauge(scr, 350, 32, lv_color_hex(NOW_PLAYING_ACCENT_COLOR));
 
-  lv_obj_t *caption = lv_label_create(scr);
-  lv_obj_set_style_text_font(caption, &lv_font_montserrat_22, 0);
-  lv_obj_set_style_text_color(caption, lv_color_hex(NOW_PLAYING_ACCENT_COLOR), 0);
-  lv_label_set_text(caption, "MEDIA");
-  lv_obj_align(caption, LV_ALIGN_CENTER, 0, -95);
+  // Top caption shows the source (e.g. "YouTube") instead of a generic
+  // "MEDIA" label (Brian, 2026-08-19: "the source should replace the word
+  // 'media' on top" — the separate small source line below the buttons,
+  // added earlier this session, read as too tiny regardless of font size at
+  // that position; this reuses the caption's existing prominent top spot and
+  // font size instead of trying to enlarge a line squeezed under the
+  // buttons). Font bumped 22px→24px same session, second pass ("slightly
+  // larger").
+  nowPlayingSourceLabel = lv_label_create(scr);
+  lv_obj_set_style_text_font(nowPlayingSourceLabel, &lv_font_montserrat_24, 0);
+  lv_obj_set_style_text_color(nowPlayingSourceLabel, lv_color_hex(NOW_PLAYING_ACCENT_COLOR), 0);
+  lv_label_set_text(nowPlayingSourceLabel, nowPlayingSource);
+  lv_obj_align(nowPlayingSourceLabel, LV_ALIGN_CENTER, 0, -85);
+
+  // Layout, revised again (Brian, 2026-08-19): the prior pass put the
+  // transport row at dead-center (y=0); Brian clarified he didn't want that
+  // literally — picture a horizontal line through screen center, buttons
+  // just *above* it, media details (artist/track) below it. Row moved to
+  // y=-35, prev/next pulled in from ±130 to ±100 (closer to Play/Pause, per
+  // Brian: "bring the prev/next buttons in a little"). Glow diameters
+  // unchanged (70/90) — still clear of each other at ±100 (closest edge gap
+  // ±100 - 45 - 35 = 20px).
+  nowPlayingPrevGlow = makeNowPlayingGlow(scr, -100, -35, 70);
+  nowPlayingPlayPauseGlow = makeNowPlayingGlow(scr, 0, -35, 90);
+  nowPlayingNextGlow = makeNowPlayingGlow(scr, 100, -35, 70);
+
+  // Prev/Next/Play-Pause as a standard transport-control row (Brian,
+  // 2026-08-19: wanted on-screen indication of where the prev/next tap zones
+  // are — previously just invisible thirds of the screen with no visual
+  // marker at all, matching only the mockup's caption text, not an icon).
+  // Smaller than Play/Pause to keep it the visual primary action, standard
+  // media-player hierarchy.
+  nowPlayingPrevIcon = lv_label_create(scr);
+  lv_obj_set_style_text_font(nowPlayingPrevIcon, &lv_font_montserrat_28, 0);
+  lv_obj_set_style_text_color(nowPlayingPrevIcon, lv_color_hex(NOW_PLAYING_ACCENT_COLOR), 0);
+  lv_label_set_text(nowPlayingPrevIcon, LV_SYMBOL_PREV);
+  lv_obj_align(nowPlayingPrevIcon, LV_ALIGN_CENTER, -100, -35);
 
   nowPlayingIcon = lv_label_create(scr);
   lv_obj_set_style_text_font(nowPlayingIcon, &lv_font_montserrat_42, 0);
   lv_obj_set_style_text_color(nowPlayingIcon, lv_color_hex(NOW_PLAYING_ACCENT_COLOR), 0);
-  lv_obj_align(nowPlayingIcon, LV_ALIGN_CENTER, 0, -50);
+  lv_obj_align(nowPlayingIcon, LV_ALIGN_CENTER, 0, -35);
 
-  // Artist (brighter) above track+elapsed (muted) — matches the mockup's
-  // exact two-line ordering, re-checked directly against the fetched
-  // artifact rather than guessed (this project's standing lesson).
-  lv_obj_t *artistLabel = lv_label_create(scr);
-  lv_obj_set_style_text_font(artistLabel, &lv_font_montserrat_22, 0);
-  lv_obj_set_style_text_color(artistLabel, lv_color_hex(0xE7ECE9), 0);
-  lv_label_set_text(artistLabel, nowPlayingArtist);
-  lv_obj_align(artistLabel, LV_ALIGN_CENTER, 0, 5);
+  nowPlayingNextIcon = lv_label_create(scr);
+  lv_obj_set_style_text_font(nowPlayingNextIcon, &lv_font_montserrat_28, 0);
+  lv_obj_set_style_text_color(nowPlayingNextIcon, lv_color_hex(NOW_PLAYING_ACCENT_COLOR), 0);
+  lv_label_set_text(nowPlayingNextIcon, LV_SYMBOL_NEXT);
+  lv_obj_align(nowPlayingNextIcon, LV_ALIGN_CENTER, 100, -35);
 
-  lv_obj_t *trackLabel = lv_label_create(scr);
-  lv_obj_set_style_text_font(trackLabel, &lv_font_montserrat_14, 0);
-  lv_obj_set_style_text_color(trackLabel, lv_color_hex(0x9AA5A3), 0);
-  lv_label_set_text_fmt(trackLabel, "%s \xC2\xB7 %s", nowPlayingTrack, nowPlayingElapsed); // \xC2\xB7 = UTF-8 middle dot
-  lv_obj_align(trackLabel, LV_ALIGN_CENTER, 0, 34);
+  // Artist (brighter, biggest of the three — Brian confirmed this size is
+  // fine) above Track above Elapsed, each their own line now (Brian,
+  // 2026-08-19, second pass: Track+Elapsed used to share one line — "since
+  // time is short, it can move to a line below... and the time and the line
+  // above it can get bigger" — splitting freed enough horizontal room to
+  // bump both). Ordering still matches the mockup's original artist-above-
+  // track layout, re-checked directly against the fetched artifact rather
+  // than guessed (this project's standing lesson) — Elapsed is new, appended
+  // after rather than disturbing that. All sit below the center line.
+  nowPlayingArtistLabel = lv_label_create(scr);
+  lv_obj_set_style_text_font(nowPlayingArtistLabel, &lv_font_montserrat_28, 0);
+  lv_obj_set_style_text_color(nowPlayingArtistLabel, lv_color_hex(0xE7ECE9), 0);
+  lv_label_set_text(nowPlayingArtistLabel, nowPlayingArtist);
+  lv_obj_align(nowPlayingArtistLabel, LV_ALIGN_CENTER, 0, 25);
+
+  // Fonts bumped one step each (Brian, 2026-08-19, third pass). Gaps pulled
+  // back in a bit on the 4th pass — round 3's 40px/40px read as too even;
+  // Brian preferred round 2's staggered look (first gap bigger than the
+  // second: 33px/28px) but wanted the overall spacing a bit more open than
+  // that. Landed in between, staggered: Artist-to-Track 36px, Track-to-
+  // Elapsed 30px. Still comfortably inside the round display's visible
+  // chord at these heights (y=91's half-width is ~172px, offline label
+  // stays clear below).
+  nowPlayingTrackLabel = lv_label_create(scr);
+  lv_obj_set_style_text_font(nowPlayingTrackLabel, &lv_font_montserrat_28, 0);
+  lv_obj_set_style_text_color(nowPlayingTrackLabel, lv_color_hex(0x9AA5A3), 0);
+  lv_label_set_text(nowPlayingTrackLabel, nowPlayingTrack);
+  lv_obj_align(nowPlayingTrackLabel, LV_ALIGN_CENTER, 0, 61);
+
+  nowPlayingElapsedLabel = lv_label_create(scr);
+  lv_obj_set_style_text_font(nowPlayingElapsedLabel, &lv_font_montserrat_24, 0);
+  lv_obj_set_style_text_color(nowPlayingElapsedLabel, lv_color_hex(0x9AA5A3), 0);
+  lv_label_set_text(nowPlayingElapsedLabel, nowPlayingElapsed);
+  lv_obj_align(nowPlayingElapsedLabel, LV_ALIGN_CENTER, 0, 91);
+
+  nowPlayingOfflineLabel = lv_label_create(scr);
+  lv_obj_set_style_text_font(nowPlayingOfflineLabel, &lv_font_montserrat_14, 0);
+  lv_obj_set_style_text_color(nowPlayingOfflineLabel, lv_color_hex(0x9AA5A3), 0);
+  lv_label_set_text(nowPlayingOfflineLabel, "PC OFFLINE");
+  lv_obj_align(nowPlayingOfflineLabel, LV_ALIGN_BOTTOM_MID, 0, -20);
+  lv_obj_add_flag(nowPlayingOfflineLabel, LV_OBJ_FLAG_HIDDEN); // shown by updateNowPlayingScreen() once pcConnected is known
 
   addNowPlayingTapZones(scr);
   updateNowPlayingScreen();
@@ -762,7 +1013,7 @@ void showNowPlayingScreen() {
 constexpr uint32_t QUICK_JUMP_RING_COLOR = 0x2EC4B6;        // teal, matches the mockup's Quick-jump card
 constexpr uint32_t QUICK_JUMP_HOME_COLOR = 0xE0A940;        // same gold as Home's CPU ring
 constexpr uint32_t QUICK_JUMP_NOW_PLAYING_COLOR = 0x4FB477; // same green as the mockup's Now Playing card
-// Longer than OVERLAY_RETURN_MS (5s) — this is a browsed menu you look at
+// Longer than volumeFuseMs (5s default) — this is a browsed menu you look at
 // and choose from, not a transient nudge like Volume/Speaker Mute.
 constexpr uint32_t QUICK_JUMP_RETURN_MS = 8000;
 
@@ -848,11 +1099,14 @@ void buildQuickJumpScreen(lv_obj_t *scr) {
   lv_obj_add_event_cb(nowPlayingSpot, [](lv_event_t *e) { showNowPlayingScreen(); }, LV_EVENT_CLICKED, NULL);
 }
 
-// Called on a detected swipe-up gesture, from Home, Volume, or Speaker Mute
-// (see quickJumpGestureCb below) — mirrors showVolumeOverlay()'s
-// remember-previous-screen pattern. Swiping up from Volume was originally
-// excluded by design (rotate-only), but Brian asked for it directly
-// (2026-08-06: "It doesn't work from the volume page, though. It should.").
+// Called on a detected swipe-up gesture, from Home, Volume, Speaker Mute, or
+// Now Playing (see quickJumpGestureCb's own screen whitelist below) — mirrors
+// showVolumeOverlay()'s remember-previous-screen pattern. Swiping up from
+// Volume was originally excluded by design (rotate-only), but Brian asked
+// for it directly (2026-08-06: "It doesn't work from the volume page,
+// though. It should."). Now Playing was missing from quickJumpGestureCb's
+// whitelist entirely until Brian caught it (2026-08-19) — added after Now
+// Playing itself (2026-08-17) without updating this list.
 void showQuickJumpMenu() {
   lv_obj_t *active = lv_screen_active();
   if (active == quickJumpScreen) return;
@@ -896,7 +1150,8 @@ void quickJumpGestureCb(lv_event_t *e) {
   if (!indev) return;
   lv_dir_t dir = lv_indev_get_gesture_dir(indev);
   lv_obj_t *active = lv_screen_active();
-  if (dir == LV_DIR_TOP && (active == homeScreen || active == volumeScreen || active == speakerMuteScreen)) {
+  if (dir == LV_DIR_TOP && (active == homeScreen || active == volumeScreen ||
+                             active == speakerMuteScreen || active == nowPlayingScreen)) {
     showQuickJumpMenu();
   }
 }
@@ -906,11 +1161,21 @@ void quickJumpGestureCb(lv_event_t *e) {
 // correct (Brian confirmed 2026-08-17: Home participates in the cycle,
 // matching the original mockup's legend — "Swipe left/right: cycle screens,
 // Volume excluded" — nothing in it excludes Home). Volume and Speaker Mute
-// stay out of this, same reasoning as Quick-jump: they're transient
-// global-input overlays, not stops on the swipe ring. Extend to genuine
-// ordered N-way cycling once a third such screen exists — not worth the
-// abstraction for two. Subscribed on the indev directly, same proven
+// aren't stops on that swipe ring, same reasoning as Quick-jump: they're
+// transient global-input overlays. Extend the Home/Now Playing toggle to
+// genuine ordered N-way cycling once a third such screen exists — not worth
+// the abstraction for two. Subscribed on the indev directly, same proven
 // approach as quickJumpGestureCb above.
+//
+// On Volume/Speaker Mute specifically, though, left/right swipe *is*
+// meaningful: an explicit dismiss, straight to the resolved return screen
+// (Brian, 2026-08-19) — skips waiting out the fuse rather than cycling
+// screens (there's nothing to cycle to from an overlay). Goes through
+// restoreScreen() so a dismiss onto another transient screen still on its
+// own countdown (Mute, if muted) gets a fresh timer, same as the fuse path.
+// Unconditional regardless of `speakerMuted` — a deliberate user gesture
+// should always work, unlike the passive idle-timeout fuse which
+// deliberately withholds auto-return while muted.
 void screenCycleGestureCb(lv_event_t *e) {
   lv_indev_t *indev = lv_indev_active();
   if (!indev) return;
@@ -921,6 +1186,10 @@ void screenCycleGestureCb(lv_event_t *e) {
     showNowPlayingScreen();
   } else if (active == nowPlayingScreen) {
     lv_screen_load(homeScreen);
+  } else if (active == volumeScreen) {
+    restoreScreen(volumeReturnScreen);
+  } else if (active == speakerMuteScreen) {
+    restoreScreen(speakerMuteReturnScreen);
   }
 }
 
@@ -1014,6 +1283,178 @@ void setupLVGL() {
   Serial.println("LVGL init OK");
 }
 
+// Docker app sync protocol (pc-dash-hub) — see ECOSYSTEM_PLAN.md's "Docker
+// app sync protocol" section for the full design. Firmware polls one
+// combined settings+PC-state endpoint over plain HTTP; no push/WebSocket
+// (matches this project's own hard-won polling-beats-push lesson, see
+// HARDWARE.md). NVS storage is one namespace, one key per settings field —
+// a firmware update adding a new field just falls back to its hardcoded
+// default instead of one corrupt blob invalidating everything.
+//
+// Runs on its own FreeRTOS task (syncPollTask, added 2026-08-19), not
+// inline in loop() as it originally was. HTTPClient.GET() blocks for up to
+// SYNC_HTTP_TIMEOUT_MS per attempt, and one poll can make two attempts
+// back-to-back (hostname, then the IP fallback) — so a slow/unresponsive
+// pc-dash-hub could stall loop() for ~8s at a time. ArduinoOTA.handle()
+// (called from loop()) has no thread of its own — it's only ever serviced
+// when loop() reaches it — so an OTA upload's UDP invitation/auth handshake
+// landing inside one of those stalls could time out or get corrupted,
+// causing an AUTH failure on the uploading side with the board itself never
+// actually going down (confirmed via WebSerial staying reachable through
+// several such failures this session — see PROGRESS.md; this was the root
+// cause, not a watchdog reset). WebSerial/OTA's own web server survived
+// those stalls fine because AsyncTCP genuinely runs its own task; this poll
+// didn't, until now. The task below does the actual blocking network I/O
+// and JSON parse entirely off the main/LVGL task, then hands the result to
+// loop() via a mutex — loop() remains the only thing that ever touches LVGL
+// objects (not thread-safe), so applying pcConnected's on-screen effect
+// stays there.
+constexpr const char *SYNC_HOST = "pcdashhub.lan"; // .lan hostname primary, SYNC_FALLBACK_IP (secrets.h) if this ever fails to resolve
+constexpr uint16_t SYNC_PORT = 8015;
+constexpr const char *SYNC_DEVICE_ID = "t-encoder-pro"; // matches WiFi.setHostname() below — pc-dash-hub has no allowlist, just needs to match
+constexpr uint32_t SYNC_POLL_INTERVAL_CONNECTED_MS = 20000; // ~15-30s once a poll has succeeded
+constexpr uint32_t SYNC_POLL_INTERVAL_RETRY_MS = 5000;      // fast retry while the hub's unreachable — also what gives near-instant resync once it comes back
+constexpr uint32_t SYNC_HTTP_TIMEOUT_MS = 4000;
+
+Preferences syncPrefs; // only ever touched from syncPollTask post-refactor — see setupSyncSettings()'s comment
+// Whether the *poll itself* reached pc-dash-hub and got a parseable 200 —
+// distinct from pcConnected (the server's own "has pc-dash-app reported in"
+// answer, currently a permanent false stub — see pcConnected's comment).
+// Kept separate so "hub unreachable" and "hub reachable, no PC yet" don't
+// get conflated in debug output. Only ever written by loop() (the result-
+// apply step below), so it needs no synchronization of its own.
+bool lastSyncPollOk = false;
+
+// Handoff from syncPollTask (background) to loop() (main/LVGL task).
+// syncResultMutex guards pendingSyncResult; syncResultPending is checked
+// without the mutex first as a cheap early-out (only a bool read) — the
+// mutex is only actually taken once there's something to apply.
+SemaphoreHandle_t syncResultMutex;
+volatile bool syncResultPending = false;
+struct SyncResult {
+  bool ok;
+  bool pcConnected;
+  uint32_t lastSeenSecondsAgo;
+  uint32_t volumeFuseMs;
+  uint32_t idleToHomeMs;
+};
+SyncResult pendingSyncResult;
+
+// GET the state blob from one host, true + fills `body` on success. Only
+// ever called from syncPollTask — safe to block here.
+bool syncGet(const char *host, String &body) {
+  HTTPClient http;
+  String url = String("http://") + host + ":" + SYNC_PORT + "/api/devices/" + SYNC_DEVICE_ID + "/state";
+  http.begin(url);
+  http.setConnectTimeout(SYNC_HTTP_TIMEOUT_MS);
+  http.setTimeout(SYNC_HTTP_TIMEOUT_MS);
+
+  int httpCode = http.GET();
+  if (httpCode != HTTP_CODE_OK) {
+    Serial.printf("sync: GET %s failed, code=%d\n", host, httpCode);
+    http.end();
+    return false;
+  }
+  body = http.getString();
+  http.end();
+  return true;
+}
+
+// One poll: GET the combined settings+PC-state blob, parse it, stage the
+// result for loop() to apply (never touches LVGL or the real globals
+// itself — see this section's top comment). Tries the .lan hostname first,
+// falls back to the static IP (secrets.h) if that fails — e.g. the
+// router's local DNS is briefly down but the box itself is fine. Stages a
+// result on every call, success or failure, so loop()'s syncOk reading
+// always reflects the most recent attempt rather than going stale. Returns
+// true on a successful, parseable response from either host — only ever
+// called from syncPollTask.
+bool pollSyncState() {
+  SyncResult result;
+  result.volumeFuseMs = volumeFuseMs; // preserved unless the payload has a real value
+  result.idleToHomeMs = idleToHomeMs;
+  result.pcConnected = false;
+  result.lastSeenSecondsAgo = 0;
+  result.ok = false;
+
+  if (WiFi.status() == WL_CONNECTED) {
+    String body;
+    if (syncGet(SYNC_HOST, body) || syncGet(SYNC_FALLBACK_IP, body)) {
+      JsonDocument doc;
+      DeserializationError err = deserializeJson(doc, body);
+      if (err) {
+        Serial.printf("sync: JSON parse failed: %s\n", err.c_str());
+      } else {
+        JsonObject timeouts = doc["settings"]["timeouts"];
+        if (!timeouts.isNull()) {
+          // Only the two timeouts are consumed today — buzzer/vibration/
+          // clockFaceId/weather/activeProfile/macros exist server-side but
+          // nothing in this firmware reads them yet (see PROGRESS.md's
+          // "Next" list); wire each up here once the feature reading it
+          // actually exists, rather than storing fields nothing uses.
+          result.volumeFuseMs = timeouts["volumeFuseMs"] | volumeFuseMs;
+          result.idleToHomeMs = timeouts["idleToHomeMs"] | idleToHomeMs;
+          if (result.volumeFuseMs != volumeFuseMs) syncPrefs.putUInt("volFuseMs", result.volumeFuseMs);
+          if (result.idleToHomeMs != idleToHomeMs) syncPrefs.putUInt("idleMs", result.idleToHomeMs);
+        }
+        // Real volume/mute/now-playing values will ride in pcState once
+        // pc-dash-app (step 4, not built yet) starts reporting them —
+        // pc-dash-hub returns pcConnected as a static stub today (always
+        // false), so volumePercent/speakerMuted/nowPlayingIsPlaying stay
+        // local-estimate-only for now regardless of what this poll returns
+        // (see each var's own comment). Nothing to reconcile against until
+        // pc-dash-app exists.
+        result.pcConnected = doc["pcState"]["pcConnected"] | false;
+        result.lastSeenSecondsAgo = doc["pcState"]["lastSeenSecondsAgo"] | 0;
+        result.ok = true;
+      }
+    }
+  }
+
+  xSemaphoreTake(syncResultMutex, portMAX_DELAY);
+  pendingSyncResult = result;
+  syncResultPending = true;
+  xSemaphoreGive(syncResultMutex);
+
+  return result.ok;
+}
+
+// Background task body — see this section's top comment for why this
+// exists. vTaskDelay() actually yields the CPU (unlike a busy-wait on
+// millis()), so this costs nothing while idle between polls. Same "retry
+// fast after failure, relax once healthy" adaptive shape as before, just
+// driven by a real task delay instead of a millis() comparison in loop().
+void syncPollTask(void *pvParameters) {
+  for (;;) {
+    bool ok = pollSyncState();
+    vTaskDelay(pdMS_TO_TICKS(ok ? SYNC_POLL_INTERVAL_CONNECTED_MS : SYNC_POLL_INTERVAL_RETRY_MS));
+  }
+}
+
+// Loads NVS-persisted settings (if any) over the hardcoded defaults already
+// assigned at global scope, then starts the background poll task. Doesn't
+// need WiFi first — called early in setup(), before setupOTA() connects —
+// operator-adjusted values (from a previous sync) take effect even if this
+// boot never reaches the Docker app at all, and the task itself just finds
+// WiFi not-yet-connected and retries at the fast interval until it is (same
+// as any other disconnected state, no special-casing needed). Pinned to
+// core 0 to stay clear of core 1's loop()/LVGL rendering entirely — not
+// just avoiding blocking it, but not competing with it for CPU time either.
+// syncPrefs (NVS) is opened here, on the main task, then only ever written
+// from syncPollTask afterward — sequential-but-cross-task, never
+// concurrent, since this function returns (and its effects are published to
+// the new task via xTaskCreatePinnedToCore) before the task's first poll
+// could possibly reach a putUInt() call.
+void setupSyncSettings() {
+  syncPrefs.begin("sync", false);
+  volumeFuseMs = syncPrefs.getUInt("volFuseMs", VOLUME_FUSE_MS_DEFAULT);
+  idleToHomeMs = syncPrefs.getUInt("idleMs", IDLE_TO_HOME_MS_DEFAULT);
+  Serial.printf("sync: loaded from NVS: volumeFuseMs=%u idleToHomeMs=%u\n", volumeFuseMs, idleToHomeMs);
+
+  syncResultMutex = xSemaphoreCreateMutex();
+  xTaskCreatePinnedToCore(syncPollTask, "syncPoll", 8192, NULL, 1, NULL, 0);
+}
+
 void setupOTA() {
   WiFi.mode(WIFI_STA);
   WiFi.setHostname("t-encoder-pro"); // DHCP/router-visible name — separate from
@@ -1063,6 +1504,7 @@ void setupWebSerial() {
 
 void setup() {
   Serial.begin(115200);
+  setupSyncSettings(); // NVS load, no WiFi needed — operator-adjusted timeouts apply even if this boot never reaches pc-dash-hub
   pinMode(PIN_ENCODER_A, INPUT_PULLUP);
   pinMode(PIN_ENCODER_B, INPUT_PULLUP);
   pinMode(PIN_ENCODER_KEY, INPUT_PULLUP);
@@ -1088,6 +1530,32 @@ void loop() {
   ArduinoOTA.handle();
   WebSerial.loop();
 
+  // Apply the latest result from syncPollTask, if any — cheap early-out
+  // first (a plain bool read), mutex only taken once there's actually
+  // something to apply. The network I/O itself doesn't happen here anymore
+  // (see the "Docker app sync protocol" section's top comment for why:
+  // loop() must never block, since ArduinoOTA.handle() above only ever gets
+  // serviced when loop() reaches it).
+  if (syncResultPending) {
+    xSemaphoreTake(syncResultMutex, portMAX_DELAY);
+    SyncResult result = pendingSyncResult;
+    syncResultPending = false;
+    xSemaphoreGive(syncResultMutex);
+
+    lastSyncPollOk = result.ok;
+    if (result.ok) {
+      bool wasPcConnected = pcConnected;
+      pcConnected = result.pcConnected;
+      lastSeenSecondsAgo = result.lastSeenSecondsAgo;
+      volumeFuseMs = result.volumeFuseMs;
+      idleToHomeMs = result.idleToHomeMs;
+      if (pcConnected != wasPcConnected) {
+        updateHomeScreen();
+        updateNowPlayingScreen();
+      }
+    }
+  }
+
   // LVGL now owns touch reads (via lvTouchpadRead(), called through this) —
   // no separate manual touch-print block needed anymore.
   lv_timer_handler();
@@ -1100,16 +1568,29 @@ void loop() {
   // to be listening.
   if (millis() - lastStatusMs > 10000) {
     lastStatusMs = millis();
-    Serial.printf("status: wifi=%s display=%s touch=%s ip=%s\n",
+    // syncOk = did the last poll actually reach pc-dash-hub and parse.
+    // pcConnected = the hub's own answer to "has pc-dash-app reported in"
+    // (currently a permanent false stub server-side — see pcConnected's
+    // comment). Logged separately on purpose: syncOk=no means "can't reach
+    // the hub," syncOk=yes+pcConnected=no means "reached it fine, it just
+    // doesn't have a PC yet" — collapsing these into one field would make
+    // the two indistinguishable from this log alone.
+    Serial.printf("status: wifi=%s display=%s touch=%s ip=%s syncOk=%s pcConnected=%s lastSeen=%us\n",
                    WiFi.status() == WL_CONNECTED ? "up" : "down",
                    displayOk ? "ok" : "FAIL",
                    touchOk ? "ok" : "FAIL",
-                   WiFi.status() == WL_CONNECTED ? WiFi.localIP().toString().c_str() : "-");
-    WebSerial.printf("status: wifi=%s display=%s touch=%s ip=%s\n",
+                   WiFi.status() == WL_CONNECTED ? WiFi.localIP().toString().c_str() : "-",
+                   lastSyncPollOk ? "yes" : "no",
+                   pcConnected ? "yes" : "no",
+                   lastSeenSecondsAgo);
+    WebSerial.printf("status: wifi=%s display=%s touch=%s ip=%s syncOk=%s pcConnected=%s lastSeen=%us\n",
                       WiFi.status() == WL_CONNECTED ? "up" : "down",
                       displayOk ? "ok" : "FAIL",
                       touchOk ? "ok" : "FAIL",
-                      WiFi.status() == WL_CONNECTED ? WiFi.localIP().toString().c_str() : "-");
+                      WiFi.status() == WL_CONNECTED ? WiFi.localIP().toString().c_str() : "-",
+                      lastSyncPollOk ? "yes" : "no",
+                      pcConnected ? "yes" : "no",
+                      lastSeenSecondsAgo);
   }
 
   // Drain whatever encoderIsr() has accumulated since the last iteration —
@@ -1140,7 +1621,7 @@ void loop() {
   }
 
   // 5s-after-last-turn fuse: restore whatever screen Volume interrupted.
-  if (lv_screen_active() == volumeScreen && (millis() - lastVolumeActivityMs) > OVERLAY_RETURN_MS) {
+  if (lv_screen_active() == volumeScreen && (millis() - lastVolumeActivityMs) > volumeFuseMs) {
     restoreScreen(volumeReturnScreen);
   }
   // Same fuse for Speaker Mute, but only while *not* muted (Brian: "when
@@ -1150,7 +1631,7 @@ void loop() {
   // The fuse only starts counting once you unmute (lastSpeakerMuteActivityMs
   // resets on every button press, so unmuting gets its own fresh 5s window).
   if (lv_screen_active() == speakerMuteScreen && !speakerMuted &&
-      (millis() - lastSpeakerMuteActivityMs) > OVERLAY_RETURN_MS) {
+      (millis() - lastSpeakerMuteActivityMs) > volumeFuseMs) {
     restoreScreen(speakerMuteReturnScreen);
   }
   // Quick-jump's own, longer idle fuse: walked away without tapping
@@ -1163,7 +1644,7 @@ void loop() {
   // (see PROGRESS.md's design rules: the standard 30s-idle-to-Home rule for
   // any non-Home screen, first real implementation of it since Now Playing
   // is the first non-overlay non-Home screen to exist).
-  if (lv_screen_active() == nowPlayingScreen && (millis() - lastNowPlayingActivityMs) > NOW_PLAYING_IDLE_MS) {
+  if (lv_screen_active() == nowPlayingScreen && (millis() - lastNowPlayingActivityMs) > idleToHomeMs) {
     lv_screen_load(homeScreen);
   }
 
