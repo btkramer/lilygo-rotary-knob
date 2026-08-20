@@ -118,14 +118,12 @@ float ramPercent = 61;
 // (clock, weather, lights, settings) is unaffected either way.
 bool pcConnected = false;
 uint32_t lastSeenSecondsAgo = 0;
-// Temporary testing override (Brian, 2026-08-19): pcConnected is always
-// false today since pc-dash-app doesn't exist yet, which makes the offline
-// dim treatment permanently active and everything hard to see while
-// iterating on this screen's own layout/legibility. Flip back to true once
-// there's a real PC to go offline from — pcConnected itself, the sync poll,
-// and NVS persistence are all untouched by this, only the *display* of the
-// dim treatment is suppressed.
-constexpr bool PC_OFFLINE_DIM_ENABLED = false;
+// pc-dash-app verified live on real Windows hardware 2026-08-20 (reported via
+// the pc-dash coordinator) — offline dim treatment re-enabled now that there's
+// a real PC to go offline from. pcConnected itself, the sync poll, and NVS
+// persistence were never touched by this flag; only the *display* of the dim
+// treatment was suppressed while testing (Brian, 2026-08-19).
+constexpr bool PC_OFFLINE_DIM_ENABLED = true;
 
 // LVGL owns its own draw buffer and rendering entirely — this replaces the
 // earlier direct-to-Arduino_GFX drawHomeScreen()/drawRingGauge() approach.
