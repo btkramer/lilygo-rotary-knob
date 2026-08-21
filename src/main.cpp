@@ -1425,11 +1425,25 @@ constexpr uint32_t SYNC_HTTP_TIMEOUT_MS = 4000;
 // recency, loop() would previously overwrite a just-set-correct local value
 // with that stale response, then self-correct on the next successful poll
 // (see coordinator-reports/pc-dash.md's T28 entry for the fuller
-// investigation, and PROGRESS.md). 3000ms covers pc-dash-app's ~1s report
-// cadence plus this device's own ~1s poll interval with margin; not measured
-// against real round-trip latency, so revisit if it's not enough for a real
-// desync to settle, or feels sluggish correcting a wrong local guess.
-constexpr uint32_t LOCAL_OPTIMISTIC_GRACE_MS = 3000;
+// investigation, and PROGRESS.md).
+//
+// T29 follow-up bug (2026-08-21): 3000ms turned out to be too tight
+// specifically for play/pause — pressing play advanced the position tick
+// twice, then stopped dead, then only the ~4s position-reconcile cadence
+// moved anything. Root cause: at ~1s poll cadence, the grace window (3000ms)
+// expires almost exactly on the *third* poll after the tap. If the real
+// backend genuinely hadn't confirmed the new play state within that window
+// yet (a real possibility — this is one detection-cycle's worth of margin,
+// zero slack), that third poll's still-stale nowPlayingIsPlaying gets
+// applied (main.cpp's sync-apply step, not the position-reconcile step —
+// reconcile never touches nowPlayingIsPlaying at all), flipping it back and
+// killing the local position tick (which requires nowPlayingIsPlaying) right
+// as the grace window closes — exactly the observed "twice, then stop"
+// shape. Bumped to 8000ms for real margin above one upstream detection
+// cycle; still not measured against real round-trip latency, so revisit
+// again if even this isn't enough, or if it starts feeling sluggish
+// correcting a genuinely wrong local guess.
+constexpr uint32_t LOCAL_OPTIMISTIC_GRACE_MS = 8000;
 
 Preferences syncPrefs; // only ever touched from syncPollTask post-refactor — see setupSyncSettings()'s comment
 // Whether the *poll itself* reached pc-dash-hub and got a parseable 200 —
