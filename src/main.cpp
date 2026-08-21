@@ -1415,35 +1415,44 @@ constexpr const char *SYNC_DEVICE_ID = "t-encoder-pro"; // matches WiFi.setHostn
 constexpr uint32_t SYNC_POLL_INTERVAL_CONNECTED_MS = 1000;
 constexpr uint32_t SYNC_POLL_INTERVAL_RETRY_MS = 5000;      // fast retry while the hub's unreachable — also what gives near-instant resync once it comes back
 constexpr uint32_t SYNC_HTTP_TIMEOUT_MS = 4000;
-// T28 (2026-08-21): grace window after a local optimistic change (knob
-// rotation / mute button / play-pause tap) during which loop()'s sync-apply
-// step ignores an incoming poll's value for that same field. Confirmed real
-// bug: a poll response can be honestly the most recent one this device has
-// received and still be stale relative to a value the user just set locally
-// moments ago, since the full app-detects-the-real-change -> PUT-to-hub ->
-// this device's next poll round trip takes real time — with nothing tracking
-// recency, loop() would previously overwrite a just-set-correct local value
-// with that stale response, then self-correct on the next successful poll
-// (see coordinator-reports/pc-dash.md's T28 entry for the fuller
-// investigation, and PROGRESS.md).
+// T28 (2026-08-21): after a local optimistic change (knob rotation / mute
+// button / play-pause tap), loop()'s sync-apply step holds that field's
+// local value against an incoming poll that still disagrees with it, rather
+// than trusting the poll unconditionally. Confirmed real bug: a poll
+// response can be honestly the most recent one this device has received and
+// still be stale relative to a value the user just set locally moments ago,
+// since the full app-detects-the-real-change -> PUT-to-hub -> this device's
+// next poll round trip takes real time — with nothing tracking recency,
+// loop() would previously overwrite a just-set-correct local value with that
+// stale response, then self-correct on the next successful poll (see
+// coordinator-reports/pc-dash.md's T28 entry for the fuller investigation).
 //
-// T29 follow-up bug (2026-08-21): 3000ms turned out to be too tight
-// specifically for play/pause — pressing play advanced the position tick
-// twice, then stopped dead, then only the ~4s position-reconcile cadence
-// moved anything. Root cause: at ~1s poll cadence, the grace window (3000ms)
-// expires almost exactly on the *third* poll after the tap. If the real
-// backend genuinely hadn't confirmed the new play state within that window
-// yet (a real possibility — this is one detection-cycle's worth of margin,
-// zero slack), that third poll's still-stale nowPlayingIsPlaying gets
-// applied (main.cpp's sync-apply step, not the position-reconcile step —
-// reconcile never touches nowPlayingIsPlaying at all), flipping it back and
-// killing the local position tick (which requires nowPlayingIsPlaying) right
-// as the grace window closes — exactly the observed "twice, then stop"
-// shape. Bumped to 8000ms for real margin above one upstream detection
-// cycle; still not measured against real round-trip latency, so revisit
-// again if even this isn't enough, or if it starts feeling sluggish
-// correcting a genuinely wrong local guess.
-constexpr uint32_t LOCAL_OPTIMISTIC_GRACE_MS = 8000;
+// T29 (2026-08-21): originally a fixed *grace window* — hold for exactly
+// LOCAL_OPTIMISTIC_GRACE_MS, then unconditionally trust whatever the very
+// next poll says, agreeing or not. Went through 3000ms, then 8000ms, and
+// each time the same failure recurred a bit later: play/pause advanced for
+// roughly the grace duration, then a still-stale poll got trusted right as
+// the window closed, flipping nowPlayingIsPlaying back and killing the local
+// position tick (which requires it) — visible as "runs for ~N seconds, then
+// falls back to reconcile-only cadence," where N tracked whatever the
+// constant currently was. That's the signature of the real backend
+// confirmation sometimes taking longer than *any* fixed window, not a wrong
+// constant — bumping it again would very likely just recur later still.
+//
+// Changed the mechanism, not just the number: hold the local value
+// indefinitely *while a poll still disagrees with it*, only ever applying a
+// differing poll value once LOCAL_OPTIMISTIC_BACKSTOP_MS has passed since
+// the local write — there's no longer a moment where the very next poll
+// after some fixed delay gets trusted unconditionally regardless of
+// agreement. A poll that already agrees is applied immediately (that's just
+// real confirmation arriving, whenever it actually does). The backstop
+// itself is a last-resort safety net for a genuinely wrong local guess (e.g.
+// an HID command that silently didn't register), not the primary
+// reconciliation path, so it's set generously long — 30000ms. This is a
+// firmware-side mitigation, not a fix for whatever's making the real
+// backend confirmation slow in the first place; see the pc-dash coordinator
+// for pc-dash-app's parallel investigation into that.
+constexpr uint32_t LOCAL_OPTIMISTIC_BACKSTOP_MS = 30000;
 
 Preferences syncPrefs; // only ever touched from syncPollTask post-refactor — see setupSyncSettings()'s comment
 // Whether the *poll itself* reached pc-dash-hub and got a parseable 200 —
@@ -1841,18 +1850,21 @@ void loop() {
       // being overwritten by the hub's never-set defaults.
       bool pcDataChanged = false;
       if (pcConnected) {
-        // T28 (2026-08-21): volumePercent/speakerMuted/nowPlayingIsPlaying are
-        // local optimistic guesses (knob rotation / mute button / tap — see
-        // each write site's own comment). A poll response can honestly be the
-        // most recent one received and still be stale relative to one of
-        // these moments after the user just set it locally — see
-        // LOCAL_OPTIMISTIC_GRACE_MS's own comment. Applying it anyway would
-        // visibly stomp a correct local value until the next poll
-        // self-corrected it back.
+        // T28/T29 (2026-08-21): volumePercent/speakerMuted/nowPlayingIsPlaying
+        // are local optimistic guesses (knob rotation / mute button / tap —
+        // see each write site's own comment). Hold each one against a poll
+        // that still disagrees with it — see LOCAL_OPTIMISTIC_BACKSTOP_MS's
+        // own comment for why this waits for actual agreement rather than
+        // expiring after a fixed delay. A poll that already agrees applies
+        // immediately (real confirmation, whenever it actually arrives); one
+        // that still disagrees is only trusted once the backstop elapses.
         uint32_t nowMs = millis();
-        bool volumeInGrace = (nowMs - lastVolumeLocalWriteMs) < LOCAL_OPTIMISTIC_GRACE_MS;
-        bool muteInGrace = (nowMs - lastMuteLocalWriteMs) < LOCAL_OPTIMISTIC_GRACE_MS;
-        bool playPauseInGrace = (nowMs - lastPlayPauseLocalWriteMs) < LOCAL_OPTIMISTIC_GRACE_MS;
+        bool volumeShouldHold = volumePercent != result.volumePercent &&
+                                 (nowMs - lastVolumeLocalWriteMs) < LOCAL_OPTIMISTIC_BACKSTOP_MS;
+        bool muteShouldHold = speakerMuted != result.speakerMuted &&
+                               (nowMs - lastMuteLocalWriteMs) < LOCAL_OPTIMISTIC_BACKSTOP_MS;
+        bool playPauseShouldHold = nowPlayingIsPlaying != result.nowPlayingIsPlaying &&
+                                    (nowMs - lastPlayPauseLocalWriteMs) < LOCAL_OPTIMISTIC_BACKSTOP_MS;
 
         // T29 (2026-08-21): position/duration dropped out of this check —
         // they're no longer applied from every poll at all (see below), so
@@ -1860,17 +1872,23 @@ void loop() {
         // purely from ordinary playback progress, which is exactly the
         // per-poll churn this device's own local position tick (loop(),
         // below) exists to avoid.
-        pcDataChanged = (!volumeInGrace && volumePercent != result.volumePercent) ||
-                         (!muteInGrace && speakerMuted != result.speakerMuted) ||
-                         (!playPauseInGrace && nowPlayingIsPlaying != result.nowPlayingIsPlaying) ||
+        pcDataChanged = (!volumeShouldHold && volumePercent != result.volumePercent) ||
+                         (!muteShouldHold && speakerMuted != result.speakerMuted) ||
+                         (!playPauseShouldHold && nowPlayingIsPlaying != result.nowPlayingIsPlaying) ||
                          nowPlayingArtist != result.nowPlayingArtist ||
                          nowPlayingTrack != result.nowPlayingTrack ||
                          nowPlayingSource != result.nowPlayingSource;
-        if (!volumeInGrace) volumePercent = result.volumePercent;
-        if (!muteInGrace) speakerMuted = result.speakerMuted;
-        if (!playPauseInGrace) {
+        if (!volumeShouldHold) volumePercent = result.volumePercent;
+        if (!muteShouldHold) speakerMuted = result.speakerMuted;
+        if (!playPauseShouldHold) {
+          bool playPauseChanged = nowPlayingIsPlaying != result.nowPlayingIsPlaying;
           nowPlayingIsPlaying = result.nowPlayingIsPlaying;
-          lastPositionTickMs = nowMs; // T29: a real (non-grace-suppressed) play/pause change also resyncs the tick anchor
+          // Only resync the tick anchor on an actual transition — this branch
+          // also runs every poll once already-confirmed (should-hold false
+          // because they already agree), and resetting the anchor on every
+          // one of those would starve the local tick entirely (it'd never
+          // see 1000ms of unbroken elapsed time between resets).
+          if (playPauseChanged) lastPositionTickMs = nowMs;
         }
         nowPlayingArtist = result.nowPlayingArtist;
         nowPlayingTrack = result.nowPlayingTrack;
