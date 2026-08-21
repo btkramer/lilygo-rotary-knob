@@ -1636,8 +1636,11 @@ void setupWebSerial() {
 // Auth reuses OTA_PASSWORD (secrets.h) as HTTP Basic Auth's password, fixed
 // username "ota" — same secret, different transport, rather than minting a
 // second one nobody will remember to keep in sync.
-bool httpOtaRebootPending = false;
-uint32_t httpOtaRebootAtMs = 0;
+// Shared by both a successful HTTP-OTA upload and the /restart endpoint
+// (T26) below — same "reboot from loop() after a grace period" mechanism
+// either way, not OTA-specific despite the name history.
+bool rebootPending = false;
+uint32_t rebootAtMs = 0;
 // Tracks the in-flight upload's success across chunk calls — a single
 // global is fine, this endpoint only ever serves one upload at a time
 // (dev tool, not a public multi-client service). Real bug found 2026-08-21:
@@ -1667,8 +1670,8 @@ void setupHttpOta() {
           // Reboot from loop() after a short grace period, not inline here
           // — give the AsyncTCP task time to actually flush this response
           // to the socket before ESP.restart() tears everything down.
-          httpOtaRebootPending = true;
-          httpOtaRebootAtMs = millis() + 500;
+          rebootPending = true;
+          rebootAtMs = millis() + 500;
         }
       },
       [](AsyncWebServerRequest *request, const String &filename, size_t index, uint8_t *data, size_t len, bool final) {
@@ -1705,6 +1708,27 @@ void setupHttpOta() {
       });
 
   Serial.println("HTTP OTA ready at /firmware-update");
+
+  // T26 (2026-08-21): OTA getting wedged badly enough to need a physical
+  // power cycle has now happened twice (T18, and again on T25) — both times
+  // with this same AsyncWebServer (plain HTTP, port 80) still answering
+  // fine throughout (confirmed via curl during the T25 wedge: espota and
+  // /firmware-update both failing, but a plain GET to "/" kept returning
+  // its normal 404 the whole time). So a GET route on this same server is a
+  // real remote-recovery path, not just a hopeful guess. Homelab-LAN-only,
+  // low-stakes — reuses OTA_PASSWORD via HTTP Basic Auth rather than a new
+  // secret or scheme, same call as /firmware-update above (a query-param
+  // shared secret would work just as well here, but a second auth style for
+  // one more admin endpoint isn't worth the inconsistency).
+  webServer.on("/restart", HTTP_GET, [](AsyncWebServerRequest *request) {
+    if (!request->authenticate("ota", OTA_PASSWORD)) {
+      return request->requestAuthentication();
+    }
+    request->send(200, "text/plain", "restarting");
+    rebootPending = true;
+    rebootAtMs = millis() + 500; // let the response flush before ESP.restart() tears the connection down
+  });
+  Serial.println("Remote restart ready at /restart");
 }
 
 void setup() {
@@ -1736,11 +1760,11 @@ void loop() {
   ArduinoOTA.handle();
   WebSerial.loop();
 
-  // HTTP OTA finished successfully (set from the AsyncTCP task — see
-  // setupHttpOta()'s comment) — reboot from here, not inline in that
-  // handler, so the AsyncTCP task gets a chance to actually flush the "OK"
-  // response to the socket first.
-  if (httpOtaRebootPending && (int32_t)(millis() - httpOtaRebootAtMs) >= 0) {
+  // A successful HTTP-OTA upload or a /restart request (T26, set from the
+  // AsyncTCP task — see setupHttpOta()'s comment) — reboot from here, not
+  // inline in either handler, so the AsyncTCP task gets a chance to actually
+  // flush the HTTP response to the socket first.
+  if (rebootPending && (int32_t)(millis() - rebootAtMs) >= 0) {
     ESP.restart();
   }
 
