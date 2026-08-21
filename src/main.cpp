@@ -725,17 +725,22 @@ char nowPlayingElapsed[24] = "1:42/3:45";
 // track/elapsed above.
 String nowPlayingSource = "YouTube";
 int nowPlayingProgressPercent = 38;
-// Raw ms, kept alongside the derived percent/formatted-string above so
-// loop()'s pcDataChanged check (T23, 2026-08-21) can detect a position-only
-// change even when nothing else about the track did — see that check's own
-// comment.
+// Raw ms. T29 (2026-08-21): this is now this device's own locally-ticking
+// clock while nowPlayingIsPlaying (advanced 1s at a time in loop(), frozen
+// while paused) — mirrors pc-dash-app's own T25 position-extrapolation fix,
+// one hop further down the pipeline — rather than only ever moving when a
+// poll happens to carry a fresher value (sync poll's granularity, ~1s, was
+// visibly a few seconds behind real playback). Reconciled against the poll's
+// real positionMs/durationMs periodically (see POSITION_RECONCILE_INTERVAL_MS)
+// to correct drift, not on every single poll — see loop()'s own comment.
 uint32_t nowPlayingPositionMs = 0;
 uint32_t nowPlayingDurationMs = 225000;
+uint32_t lastPositionTickMs = 0;      // millis() the local clock last advanced by one tick
+uint32_t lastPositionReconcileMs = 0; // millis() position/duration were last snapped from a poll
+constexpr uint32_t POSITION_TICK_MS = 1000;
+constexpr uint32_t POSITION_RECONCILE_INTERVAL_MS = 4000;
 
-// "current/total" (e.g. "1:23/3:45", T22) from raw ms values — sync poll's
-// granularity (~20s), not a locally-ticking clock; matches the same
-// periodic-reconciliation pattern as volumePercent rather than adding a new
-// per-second timer.
+// "current/total" (e.g. "1:23/3:45", T22) from raw ms values.
 void formatNowPlayingElapsed(uint32_t positionMs, uint32_t durationMs) {
   uint32_t posSec = positionMs / 1000;
   uint32_t durSec = durationMs / 1000;
@@ -916,6 +921,7 @@ void nowPlayingPlayPauseCb(lv_event_t *e) {
   ConsumerControl.release();
   nowPlayingIsPlaying = !nowPlayingIsPlaying;
   lastPlayPauseLocalWriteMs = millis(); // T28: don't let a lagging poll response stomp this
+  lastPositionTickMs = millis(); // T29: resume/pause here, not mid-tick — avoids a catch-up burst on resume
   updateNowPlayingScreen();
   nowPlayingPulseGlow(nowPlayingPlayPauseGlow);
   lastNowPlayingActivityMs = millis();
@@ -1821,48 +1827,58 @@ void loop() {
       // being overwritten by the hub's never-set defaults.
       bool pcDataChanged = false;
       if (pcConnected) {
-        // T23 (Brian, 2026-08-21): position/duration used to be left out of
-        // this check entirely, so a poll where *only* playback position
-        // advanced (the common case — title/artist/play-state don't change
-        // every 20s poll, position does) never called updateNowPlayingScreen()
-        // below, even though the underlying vars were already being updated
-        // correctly. Screen looked stuck on an old position until something
-        // else (e.g. play/pause) happened to change alongside it.
-        //
         // T28 (2026-08-21): volumePercent/speakerMuted/nowPlayingIsPlaying are
-        // also local optimistic guesses (knob rotation / mute button / tap —
-        // see each write site's own comment), separate from position/duration/
-        // artist/track/source which only ever come from a poll. A poll response
-        // can honestly be the most recent one received and still be stale
-        // relative to one of these moments after the user just set it locally
-        // — see LOCAL_OPTIMISTIC_GRACE_MS's own comment. Applying it anyway
-        // would visibly stomp a correct local value until the next poll
+        // local optimistic guesses (knob rotation / mute button / tap — see
+        // each write site's own comment). A poll response can honestly be the
+        // most recent one received and still be stale relative to one of
+        // these moments after the user just set it locally — see
+        // LOCAL_OPTIMISTIC_GRACE_MS's own comment. Applying it anyway would
+        // visibly stomp a correct local value until the next poll
         // self-corrected it back.
         uint32_t nowMs = millis();
         bool volumeInGrace = (nowMs - lastVolumeLocalWriteMs) < LOCAL_OPTIMISTIC_GRACE_MS;
         bool muteInGrace = (nowMs - lastMuteLocalWriteMs) < LOCAL_OPTIMISTIC_GRACE_MS;
         bool playPauseInGrace = (nowMs - lastPlayPauseLocalWriteMs) < LOCAL_OPTIMISTIC_GRACE_MS;
 
+        // T29 (2026-08-21): position/duration dropped out of this check —
+        // they're no longer applied from every poll at all (see below), so
+        // comparing them here would force a full redraw ~every ~1s poll
+        // purely from ordinary playback progress, which is exactly the
+        // per-poll churn this device's own local position tick (loop(),
+        // below) exists to avoid.
         pcDataChanged = (!volumeInGrace && volumePercent != result.volumePercent) ||
                          (!muteInGrace && speakerMuted != result.speakerMuted) ||
                          (!playPauseInGrace && nowPlayingIsPlaying != result.nowPlayingIsPlaying) ||
                          nowPlayingArtist != result.nowPlayingArtist ||
                          nowPlayingTrack != result.nowPlayingTrack ||
-                         nowPlayingSource != result.nowPlayingSource ||
-                         nowPlayingPositionMs != result.nowPlayingPositionMs ||
-                         nowPlayingDurationMs != result.nowPlayingDurationMs;
+                         nowPlayingSource != result.nowPlayingSource;
         if (!volumeInGrace) volumePercent = result.volumePercent;
         if (!muteInGrace) speakerMuted = result.speakerMuted;
-        if (!playPauseInGrace) nowPlayingIsPlaying = result.nowPlayingIsPlaying;
+        if (!playPauseInGrace) {
+          nowPlayingIsPlaying = result.nowPlayingIsPlaying;
+          lastPositionTickMs = nowMs; // T29: a real (non-grace-suppressed) play/pause change also resyncs the tick anchor
+        }
         nowPlayingArtist = result.nowPlayingArtist;
         nowPlayingTrack = result.nowPlayingTrack;
         nowPlayingSource = result.nowPlayingSource;
-        nowPlayingPositionMs = result.nowPlayingPositionMs;
-        nowPlayingDurationMs = result.nowPlayingDurationMs;
-        nowPlayingProgressPercent = nowPlayingDurationMs > 0
-            ? constrain((int)(((uint64_t)nowPlayingPositionMs * 100) / nowPlayingDurationMs), 0, 100)
-            : 0;
-        formatNowPlayingElapsed(nowPlayingPositionMs, nowPlayingDurationMs); // T22: now "current/total"
+
+        // T29: reconcile the locally-ticking position/duration against the
+        // poll's real values periodically (not every ~1s poll — see
+        // POSITION_RECONCILE_INTERVAL_MS's own comment), except right on the
+        // connect transition, where waiting even a few seconds to show real
+        // data instead of the placeholder/last-known value isn't worth it.
+        bool justConnected = !wasPcConnected;
+        if (justConnected || (nowMs - lastPositionReconcileMs) >= POSITION_RECONCILE_INTERVAL_MS) {
+          nowPlayingPositionMs = result.nowPlayingPositionMs;
+          nowPlayingDurationMs = result.nowPlayingDurationMs;
+          lastPositionReconcileMs = nowMs;
+          lastPositionTickMs = nowMs;
+          nowPlayingProgressPercent = nowPlayingDurationMs > 0
+              ? constrain((int)(((uint64_t)nowPlayingPositionMs * 100) / nowPlayingDurationMs), 0, 100)
+              : 0;
+          formatNowPlayingElapsed(nowPlayingPositionMs, nowPlayingDurationMs); // T22: "current/total"
+          pcDataChanged = true; // make a real drift correction visible immediately, not on the next unrelated redraw
+        }
         updateVolumeScreen();
         updateSpeakerMuteScreen();
       }
@@ -1872,6 +1888,27 @@ void loop() {
         updateNowPlayingScreen();
       }
     }
+  }
+
+  // T29 (2026-08-21): advance the displayed elapsed time by one real second
+  // at a time while actually playing — independent of poll cadence entirely,
+  // unlike the block above. Only one tick per loop() iteration (not a
+  // catch-up while-loop): loop() runs far more often than once a second for
+  // LVGL rendering, so falling behind (e.g. a brief stall) is caught up
+  // within a handful of iterations, not a visible jump. Frozen (anchor reset
+  // to "now", no backlog accrued) whenever not actually advancing — paused,
+  // disconnected, or no real duration yet — so resuming playback later never
+  // bursts forward by however long it was paused.
+  if (pcConnected && nowPlayingIsPlaying && nowPlayingDurationMs > 0) {
+    if (millis() - lastPositionTickMs >= POSITION_TICK_MS && nowPlayingPositionMs < nowPlayingDurationMs) {
+      lastPositionTickMs += POSITION_TICK_MS;
+      nowPlayingPositionMs = min(nowPlayingPositionMs + POSITION_TICK_MS, nowPlayingDurationMs);
+      nowPlayingProgressPercent = constrain((int)(((uint64_t)nowPlayingPositionMs * 100) / nowPlayingDurationMs), 0, 100);
+      formatNowPlayingElapsed(nowPlayingPositionMs, nowPlayingDurationMs);
+      updateNowPlayingScreen();
+    }
+  } else {
+    lastPositionTickMs = millis();
   }
 
   // LVGL now owns touch reads (via lvTouchpadRead(), called through this) —
