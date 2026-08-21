@@ -6,6 +6,7 @@
 #include <Arduino.h>
 #include <WiFi.h>
 #include <ArduinoOTA.h>
+#include <Update.h>
 #include <Arduino_GFX_Library.h>
 #include <TouchDrv.hpp>
 #include <lvgl.h>
@@ -1551,6 +1552,81 @@ void setupWebSerial() {
   Serial.println("WebSerial ready at /webserial");
 }
 
+// HTTP-based OTA (added 2026-08-21) — a single-connection POST upload,
+// alongside ArduinoOTA rather than replacing it. Exists because ArduinoOTA's
+// espota protocol is stop-and-wait (one ~1460-byte TCP chunk, wait for a
+// text ACK, repeat — ~1,150 round trips for this firmware's ~1.7MB image),
+// which measured at ~266s for one flash. This POST handler streams the body
+// as AsyncTCP delivers it — no per-chunk ACK round trip — and, critically,
+// runs from AsyncTCP's own task, not loop(), so it isn't gated by loop()'s
+// per-iteration LVGL/encoder work either (see the "OTA transfer speed"
+// investigation in PROGRESS.md/conversation history for why that doesn't
+// actually matter for ArduinoOTA's *transfer* phase specifically, but does
+// for its invitation/auth handshake — this path sidesteps both).
+// Auth reuses OTA_PASSWORD (secrets.h) as HTTP Basic Auth's password, fixed
+// username "ota" — same secret, different transport, rather than minting a
+// second one nobody will remember to keep in sync.
+bool httpOtaRebootPending = false;
+uint32_t httpOtaRebootAtMs = 0;
+
+void setupHttpOta() {
+  if (WiFi.status() != WL_CONNECTED) return; // no WiFi, no HTTP OTA — same as ArduinoOTA/WebSerial
+
+  webServer.on(
+      "/firmware-update", HTTP_POST,
+      [](AsyncWebServerRequest *request) {
+        // Fires once after the upload handler below has already processed
+        // the whole body — too late to reject an unauthenticated *upload*
+        // (the upload handler's own index==0 check below is what actually
+        // gates that), but this is still where the HTTP response for the
+        // request goes, auth failure included.
+        if (!request->authenticate("ota", OTA_PASSWORD)) {
+          return request->requestAuthentication();
+        }
+        bool ok = !Update.hasError();
+        request->send(ok ? 200 : 500, "text/plain", ok ? "OK" : "FAIL");
+        if (ok) {
+          // Reboot from loop() after a short grace period, not inline here
+          // — give the AsyncTCP task time to actually flush this response
+          // to the socket before ESP.restart() tears everything down.
+          httpOtaRebootPending = true;
+          httpOtaRebootAtMs = millis() + 500;
+        }
+      },
+      [](AsyncWebServerRequest *request, const String &filename, size_t index, uint8_t *data, size_t len, bool final) {
+        if (!index) {
+          if (!request->authenticate("ota", OTA_PASSWORD)) {
+            Serial.println("HTTP OTA: rejected, bad auth");
+            return; // main handler above still runs and sends 401 once the (now-ignored) body finishes arriving
+          }
+          Serial.printf("HTTP OTA: start, filename=%s\n", filename.c_str());
+          if (!Update.begin(UPDATE_SIZE_UNKNOWN)) {
+            Update.printError(Serial);
+          }
+        }
+        if (!request->authenticate("ota", OTA_PASSWORD)) return; // keep rejecting every chunk of a bad-auth upload
+        if (len) Update.write(data, len);
+        // Yield after every chunk — AsyncTCP can deliver large chunks
+        // back-to-back with no gap between them (unlike ArduinoOTA's own
+        // _runUpdate(), which naturally paces itself via delay(1) while
+        // polling client.available()). Without this, a full-size image's
+        // worth of back-to-back flash writes on this task starved the idle
+        // task long enough to trip the watchdog and silently reboot the
+        // board mid-transfer (confirmed: a first attempt without this
+        // failed partway through and the board came back up on its own).
+        delay(1);
+        if (final) {
+          if (Update.end(true)) {
+            Serial.printf("HTTP OTA: done, %u bytes\n", (unsigned)(index + len));
+          } else {
+            Update.printError(Serial);
+          }
+        }
+      });
+
+  Serial.println("HTTP OTA ready at /firmware-update");
+}
+
 void setup() {
   Serial.begin(115200);
   setupSyncSettings(); // NVS load, no WiFi needed — operator-adjusted timeouts apply even if this boot never reaches pc-dash-hub
@@ -1567,6 +1643,7 @@ void setup() {
   setupLVGL();
   setupOTA();
   setupWebSerial();
+  setupHttpOta();
 
   Serial.println("T-Encoder Pro: HID volume/mute ready");
 }
@@ -1578,6 +1655,14 @@ void loop() {
 
   ArduinoOTA.handle();
   WebSerial.loop();
+
+  // HTTP OTA finished successfully (set from the AsyncTCP task — see
+  // setupHttpOta()'s comment) — reboot from here, not inline in that
+  // handler, so the AsyncTCP task gets a chance to actually flush the "OK"
+  // response to the socket first.
+  if (httpOtaRebootPending && (int32_t)(millis() - httpOtaRebootAtMs) >= 0) {
+    ESP.restart();
+  }
 
   // Apply the latest result from syncPollTask, if any — cheap early-out
   // first (a plain bool read), mutex only taken once there's actually
