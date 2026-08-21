@@ -1383,7 +1383,20 @@ void setupLVGL() {
 constexpr const char *SYNC_HOST = "pcdashhub.lan"; // .lan hostname primary, SYNC_FALLBACK_IP (secrets.h) if this ever fails to resolve
 constexpr uint16_t SYNC_PORT = 8015;
 constexpr const char *SYNC_DEVICE_ID = "t-encoder-pro"; // matches WiFi.setHostname() below — pc-dash-hub has no allowlist, just needs to match
-constexpr uint32_t SYNC_POLL_INTERVAL_CONNECTED_MS = 20000; // flat 20s, not a range — see ECOSYSTEM_PLAN.md's "Docker app sync protocol" section
+// T25 (Brian, 2026-08-21): dropped from a flat 20s to 1s — his feedback on T20-T23
+// was that Now Playing (artist/track/position) lagged real changes by ~10-20s, with
+// artist/track and position visibly landing several seconds apart from each other.
+// T23 fixed a real redraw-gate bug, but the dominant remaining cause was this
+// interval itself: every field in the combined settings+pcState blob (there's no
+// per-field split — one endpoint, one poll, one interval) was only ever as fresh as
+// the last poll, up to 20s stale. No architecture change needed to fix this — the
+// blocking GET already runs on its own FreeRTOS task (syncPollTask, off loop()/LVGL
+// entirely, see this section's top comment), so polling 20x more often just means
+// 20x more small local-LAN requests, not a new stall risk. Kept as a poll rather than
+// switching to a push/WebSocket model — plain HTTP GET is simpler to reason about
+// and this cadence already gets within roughly a poll-and-a-half of Brian's ~1s
+// "on-change, capped at 1Hz" target end-to-end.
+constexpr uint32_t SYNC_POLL_INTERVAL_CONNECTED_MS = 1000;
 constexpr uint32_t SYNC_POLL_INTERVAL_RETRY_MS = 5000;      // fast retry while the hub's unreachable — also what gives near-instant resync once it comes back
 constexpr uint32_t SYNC_HTTP_TIMEOUT_MS = 4000;
 
