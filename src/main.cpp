@@ -988,6 +988,17 @@ void buildNowPlayingScreen(lv_obj_t *scr) {
   nowPlayingTrackLabel = lv_label_create(scr);
   lv_obj_set_style_text_font(nowPlayingTrackLabel, &lv_font_montserrat_28, 0);
   lv_obj_set_style_text_color(nowPlayingTrackLabel, lv_color_hex(0x9AA5A3), 0);
+  // T16 (2026-08-21): real track titles (SMTC-sourced, not this project's own
+  // placeholder data) run well past the panel — LVGL's circular-scroll long
+  // mode marquees automatically only when the text actually overflows this
+  // fixed width (short titles stay static/centered, no animation), so this
+  // needs a real width instead of the default content-auto-sized one. 320px
+  // stays safely inside the round display's visible chord at this label's
+  // y=61 offset (~370px full chord — see the Elapsed label's own comment
+  // below for the same chord-math pattern at y=91).
+  lv_obj_set_width(nowPlayingTrackLabel, 320);
+  lv_obj_set_style_text_align(nowPlayingTrackLabel, LV_TEXT_ALIGN_CENTER, 0);
+  lv_label_set_long_mode(nowPlayingTrackLabel, LV_LABEL_LONG_MODE_SCROLL_CIRCULAR);
   lv_label_set_text(nowPlayingTrackLabel, nowPlayingTrack.c_str());
   lv_obj_align(nowPlayingTrackLabel, LV_ALIGN_CENTER, 0, 61);
 
@@ -1328,7 +1339,7 @@ void setupLVGL() {
 constexpr const char *SYNC_HOST = "pcdashhub.lan"; // .lan hostname primary, SYNC_FALLBACK_IP (secrets.h) if this ever fails to resolve
 constexpr uint16_t SYNC_PORT = 8015;
 constexpr const char *SYNC_DEVICE_ID = "t-encoder-pro"; // matches WiFi.setHostname() below — pc-dash-hub has no allowlist, just needs to match
-constexpr uint32_t SYNC_POLL_INTERVAL_CONNECTED_MS = 20000; // ~15-30s once a poll has succeeded
+constexpr uint32_t SYNC_POLL_INTERVAL_CONNECTED_MS = 20000; // flat 20s, not a range — see ECOSYSTEM_PLAN.md's "Docker app sync protocol" section
 constexpr uint32_t SYNC_POLL_INTERVAL_RETRY_MS = 5000;      // fast retry while the hub's unreachable — also what gives near-instant resync once it comes back
 constexpr uint32_t SYNC_HTTP_TIMEOUT_MS = 4000;
 
@@ -1568,6 +1579,14 @@ void setupWebSerial() {
 // second one nobody will remember to keep in sync.
 bool httpOtaRebootPending = false;
 uint32_t httpOtaRebootAtMs = 0;
+// Tracks the in-flight upload's success across chunk calls — a single
+// global is fine, this endpoint only ever serves one upload at a time
+// (dev tool, not a public multi-client service). Real bug found 2026-08-21:
+// without this, a failed Update.begin() (e.g. a prior upload's session
+// never cleanly finished) was silently ignored and every subsequent chunk
+// got written anyway, which corrupted state badly enough that later upload
+// attempts failed early (~64KB in) with the connection just dropping.
+bool httpOtaUploadOk = false;
 
 void setupHttpOta() {
   if (WiFi.status() != WL_CONNECTED) return; // no WiFi, no HTTP OTA — same as ArduinoOTA/WebSerial
@@ -1583,7 +1602,7 @@ void setupHttpOta() {
         if (!request->authenticate("ota", OTA_PASSWORD)) {
           return request->requestAuthentication();
         }
-        bool ok = !Update.hasError();
+        bool ok = httpOtaUploadOk && !Update.hasError();
         request->send(ok ? 200 : 500, "text/plain", ok ? "OK" : "FAIL");
         if (ok) {
           // Reboot from loop() after a short grace period, not inline here
@@ -1595,16 +1614,17 @@ void setupHttpOta() {
       },
       [](AsyncWebServerRequest *request, const String &filename, size_t index, uint8_t *data, size_t len, bool final) {
         if (!index) {
+          httpOtaUploadOk = false; // reset for this upload; only set true once begin() actually succeeds
           if (!request->authenticate("ota", OTA_PASSWORD)) {
             Serial.println("HTTP OTA: rejected, bad auth");
             return; // main handler above still runs and sends 401 once the (now-ignored) body finishes arriving
           }
           Serial.printf("HTTP OTA: start, filename=%s\n", filename.c_str());
-          if (!Update.begin(UPDATE_SIZE_UNKNOWN)) {
-            Update.printError(Serial);
-          }
+          httpOtaUploadOk = Update.begin(UPDATE_SIZE_UNKNOWN);
+          if (!httpOtaUploadOk) Update.printError(Serial);
         }
         if (!request->authenticate("ota", OTA_PASSWORD)) return; // keep rejecting every chunk of a bad-auth upload
+        if (!httpOtaUploadOk) return; // begin() already failed (or a prior chunk's write/end did) — stop touching Update
         if (len) Update.write(data, len);
         // Yield after every chunk — AsyncTCP can deliver large chunks
         // back-to-back with no gap between them (unlike ArduinoOTA's own
@@ -1620,6 +1640,7 @@ void setupHttpOta() {
             Serial.printf("HTTP OTA: done, %u bytes\n", (unsigned)(index + len));
           } else {
             Update.printError(Serial);
+            httpOtaUploadOk = false;
           }
         }
       });
