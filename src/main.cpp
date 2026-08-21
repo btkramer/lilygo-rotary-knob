@@ -1906,13 +1906,10 @@ void loop() {
 
   // T29 (2026-08-21): advance the displayed elapsed time by one real second
   // at a time while actually playing — independent of poll cadence entirely,
-  // unlike the block above. Only one tick per loop() iteration (not a
-  // catch-up while-loop): loop() runs far more often than once a second for
-  // LVGL rendering, so falling behind (e.g. a brief stall) is caught up
-  // within a handful of iterations, not a visible jump. Frozen (anchor reset
-  // to "now", no backlog accrued) whenever not actually advancing — paused or
-  // disconnected — so resuming playback later never bursts forward by however
-  // long it was paused.
+  // unlike the block above. Frozen (anchor reset to "now", no backlog
+  // accrued) whenever not actually advancing — paused or disconnected — so
+  // resuming playback later never bursts forward by however long it was
+  // paused.
   //
   // Correction (2026-08-21): the first version of this also required
   // nowPlayingDurationMs > 0 to tick at all, on top of pcConnected/
@@ -1924,13 +1921,34 @@ void loop() {
   // the two fields that actually mean "is real playback progressing" —
   // duration now only affects the cap/percent, both already guarded for 0
   // separately.
+  //
+  // Second correction (2026-08-21): Brian then reported the local clock
+  // running slow — drifting a few seconds behind real elapsed time between
+  // reconciles. The peer theory was a classic anchor-reset-to-wall-clock bug,
+  // but that's not what this does (it accumulates `lastPositionTickMs +=
+  // POSITION_TICK_MS`, not `= millis()`, precisely so a late tick doesn't
+  // lose the delay). The actual gap: this used to do only *one* tick per
+  // loop() iteration, on the assumption loop() runs far more often than once
+  // a second so falling behind would catch up within a handful of
+  // iterations — an assumption that isn't safe to lean on given loop() also
+  // does LVGL rendering, HID, and OTA/WebSerial handling every pass and can
+  // genuinely run slower than 1Hz at times. Switched to a bounded `while`
+  // that catches up as many whole ticks as have actually elapsed in one
+  // pass, so real elapsed time is what's tracked regardless of how often
+  // loop() itself gets to check — no assumption about loop()'s own speed
+  // required anymore. Redraws once per loop() pass (not once per caught-up
+  // tick) to avoid redundant LVGL work when catching up several at once.
   if (pcConnected && nowPlayingIsPlaying) {
-    if (millis() - lastPositionTickMs >= POSITION_TICK_MS &&
-        (nowPlayingDurationMs == 0 || nowPlayingPositionMs < nowPlayingDurationMs)) {
+    bool ticked = false;
+    while (millis() - lastPositionTickMs >= POSITION_TICK_MS &&
+           (nowPlayingDurationMs == 0 || nowPlayingPositionMs < nowPlayingDurationMs)) {
       lastPositionTickMs += POSITION_TICK_MS;
       nowPlayingPositionMs = nowPlayingDurationMs > 0
           ? min(nowPlayingPositionMs + POSITION_TICK_MS, nowPlayingDurationMs)
           : nowPlayingPositionMs + POSITION_TICK_MS;
+      ticked = true;
+    }
+    if (ticked) {
       nowPlayingProgressPercent = nowPlayingDurationMs > 0
           ? constrain((int)(((uint64_t)nowPlayingPositionMs * 100) / nowPlayingDurationMs), 0, 100)
           : 0;
@@ -1941,17 +1959,25 @@ void loop() {
     lastPositionTickMs = millis();
   }
 
-  // Debug aid (2026-08-21): prints the tick gate's own inputs every 5s so a
-  // WebSerial/serial capture during a live test can show definitively
-  // whether pcConnected/nowPlayingIsPlaying/durationMs were what's actually
-  // blocking it, rather than guessing again from another report alone.
+  // Debug aid (2026-08-21): prints the tick gate's own inputs every 5s,
+  // including a real timestamp and how many loop() iterations happened in
+  // that window, so a WebSerial/serial capture during a live test can show
+  // definitively both what's blocking the tick (if anything) and whether
+  // loop() itself is genuinely running slower than assumed.
   static uint32_t lastPositionTickDebugMs = 0;
+  static uint32_t loopIterCount = 0;
+  loopIterCount++;
   if (millis() - lastPositionTickDebugMs >= 5000) {
-    lastPositionTickDebugMs = millis();
-    Serial.printf("posTick: pcConnected=%d playing=%d pos=%ums dur=%ums\n",
-                  pcConnected, nowPlayingIsPlaying, nowPlayingPositionMs, nowPlayingDurationMs);
-    WebSerial.printf("posTick: pcConnected=%d playing=%d pos=%ums dur=%ums\n",
-                      pcConnected, nowPlayingIsPlaying, nowPlayingPositionMs, nowPlayingDurationMs);
+    uint32_t nowDebugMs = millis();
+    uint32_t windowMs = nowDebugMs - lastPositionTickDebugMs;
+    lastPositionTickDebugMs = nowDebugMs;
+    Serial.printf("posTick: t=%ums pcConnected=%d playing=%d pos=%ums dur=%ums loopIters=%u/%ums\n",
+                  nowDebugMs, pcConnected, nowPlayingIsPlaying, nowPlayingPositionMs, nowPlayingDurationMs,
+                  loopIterCount, windowMs);
+    WebSerial.printf("posTick: t=%ums pcConnected=%d playing=%d pos=%ums dur=%ums loopIters=%u/%ums\n",
+                      nowDebugMs, pcConnected, nowPlayingIsPlaying, nowPlayingPositionMs, nowPlayingDurationMs,
+                      loopIterCount, windowMs);
+    loopIterCount = 0;
   }
 
   // LVGL now owns touch reads (via lvTouchpadRead(), called through this) —
