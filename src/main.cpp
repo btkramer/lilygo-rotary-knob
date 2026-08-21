@@ -317,6 +317,11 @@ constexpr int VOLUME_STEP = 2;
 constexpr uint32_t VOLUME_FUSE_MS_DEFAULT = 5000;
 uint32_t volumeFuseMs = VOLUME_FUSE_MS_DEFAULT;
 int volumePercent = 50;
+// T28 (2026-08-21): when this local optimistic guess was last changed by knob
+// rotation — distinct from lastVolumeActivityMs below (which also bumps on
+// just re-entering the screen, an unrelated UI-fuse concern). See this
+// section's use in loop()'s sync-apply step for why it exists.
+uint32_t lastVolumeLocalWriteMs = 0;
 uint32_t lastVolumeActivityMs = 0;
 // Declared together with lastVolumeActivityMs (rather than down where each
 // is actually used) since restoreScreen() below needs all three up front.
@@ -390,6 +395,7 @@ lv_obj_t *speakerMuteReturnScreen;
 // showVolumeOverlay() below needs it in scope — local estimate only, HID
 // mute is a toggle with no readback.
 bool speakerMuted = false;
+uint32_t lastMuteLocalWriteMs = 0; // T28 — see lastVolumeLocalWriteMs's comment
 lv_obj_t *quickJumpReturnScreen;
 
 // Loads `target` and, if target is itself one of the three transient
@@ -518,6 +524,7 @@ void showVolumeOverlay(int delta) {
     lv_screen_load(volumeScreen);
   }
   volumePercent = constrain(volumePercent + delta, 0, 100);
+  lastVolumeLocalWriteMs = millis(); // T28: don't let a lagging poll response stomp this
   updateVolumeScreen();
   lastVolumeActivityMs = millis();
 }
@@ -675,6 +682,7 @@ void showSpeakerMuteOverlay() {
     lv_screen_load(speakerMuteScreen);
   }
   speakerMuted = !speakerMuted;
+  lastMuteLocalWriteMs = millis(); // T28: don't let a lagging poll response stomp this
   ConsumerControl.press(CONSUMER_CONTROL_MUTE);
   ConsumerControl.release();
   updateSpeakerMuteScreen();
@@ -771,6 +779,7 @@ String normalizeSmartPunctuation(const String &in) {
 // icon-shows-current-state convention, since transport controls are a
 // different, well-established UI vocabulary.
 bool nowPlayingIsPlaying = true;
+uint32_t lastPlayPauseLocalWriteMs = 0; // T28 — see lastVolumeLocalWriteMs's comment
 uint32_t lastNowPlayingActivityMs = 0;
 
 lv_obj_t *nowPlayingScreen; // declared here (not up with the other screens) since it's built later in file order
@@ -906,6 +915,7 @@ void nowPlayingPlayPauseCb(lv_event_t *e) {
   ConsumerControl.press(CONSUMER_CONTROL_PLAY_PAUSE);
   ConsumerControl.release();
   nowPlayingIsPlaying = !nowPlayingIsPlaying;
+  lastPlayPauseLocalWriteMs = millis(); // T28: don't let a lagging poll response stomp this
   updateNowPlayingScreen();
   nowPlayingPulseGlow(nowPlayingPlayPauseGlow);
   lastNowPlayingActivityMs = millis();
@@ -1399,6 +1409,21 @@ constexpr const char *SYNC_DEVICE_ID = "t-encoder-pro"; // matches WiFi.setHostn
 constexpr uint32_t SYNC_POLL_INTERVAL_CONNECTED_MS = 1000;
 constexpr uint32_t SYNC_POLL_INTERVAL_RETRY_MS = 5000;      // fast retry while the hub's unreachable — also what gives near-instant resync once it comes back
 constexpr uint32_t SYNC_HTTP_TIMEOUT_MS = 4000;
+// T28 (2026-08-21): grace window after a local optimistic change (knob
+// rotation / mute button / play-pause tap) during which loop()'s sync-apply
+// step ignores an incoming poll's value for that same field. Confirmed real
+// bug: a poll response can be honestly the most recent one this device has
+// received and still be stale relative to a value the user just set locally
+// moments ago, since the full app-detects-the-real-change -> PUT-to-hub ->
+// this device's next poll round trip takes real time — with nothing tracking
+// recency, loop() would previously overwrite a just-set-correct local value
+// with that stale response, then self-correct on the next successful poll
+// (see coordinator-reports/pc-dash.md's T28 entry for the fuller
+// investigation, and PROGRESS.md). 3000ms covers pc-dash-app's ~1s report
+// cadence plus this device's own ~1s poll interval with margin; not measured
+// against real round-trip latency, so revisit if it's not enough for a real
+// desync to settle, or feels sluggish correcting a wrong local guess.
+constexpr uint32_t LOCAL_OPTIMISTIC_GRACE_MS = 3000;
 
 Preferences syncPrefs; // only ever touched from syncPollTask post-refactor — see setupSyncSettings()'s comment
 // Whether the *poll itself* reached pc-dash-hub and got a parseable 200 —
@@ -1803,17 +1828,32 @@ void loop() {
         // below, even though the underlying vars were already being updated
         // correctly. Screen looked stuck on an old position until something
         // else (e.g. play/pause) happened to change alongside it.
-        pcDataChanged = volumePercent != result.volumePercent ||
-                         speakerMuted != result.speakerMuted ||
-                         nowPlayingIsPlaying != result.nowPlayingIsPlaying ||
+        //
+        // T28 (2026-08-21): volumePercent/speakerMuted/nowPlayingIsPlaying are
+        // also local optimistic guesses (knob rotation / mute button / tap —
+        // see each write site's own comment), separate from position/duration/
+        // artist/track/source which only ever come from a poll. A poll response
+        // can honestly be the most recent one received and still be stale
+        // relative to one of these moments after the user just set it locally
+        // — see LOCAL_OPTIMISTIC_GRACE_MS's own comment. Applying it anyway
+        // would visibly stomp a correct local value until the next poll
+        // self-corrected it back.
+        uint32_t nowMs = millis();
+        bool volumeInGrace = (nowMs - lastVolumeLocalWriteMs) < LOCAL_OPTIMISTIC_GRACE_MS;
+        bool muteInGrace = (nowMs - lastMuteLocalWriteMs) < LOCAL_OPTIMISTIC_GRACE_MS;
+        bool playPauseInGrace = (nowMs - lastPlayPauseLocalWriteMs) < LOCAL_OPTIMISTIC_GRACE_MS;
+
+        pcDataChanged = (!volumeInGrace && volumePercent != result.volumePercent) ||
+                         (!muteInGrace && speakerMuted != result.speakerMuted) ||
+                         (!playPauseInGrace && nowPlayingIsPlaying != result.nowPlayingIsPlaying) ||
                          nowPlayingArtist != result.nowPlayingArtist ||
                          nowPlayingTrack != result.nowPlayingTrack ||
                          nowPlayingSource != result.nowPlayingSource ||
                          nowPlayingPositionMs != result.nowPlayingPositionMs ||
                          nowPlayingDurationMs != result.nowPlayingDurationMs;
-        volumePercent = result.volumePercent;
-        speakerMuted = result.speakerMuted;
-        nowPlayingIsPlaying = result.nowPlayingIsPlaying;
+        if (!volumeInGrace) volumePercent = result.volumePercent;
+        if (!muteInGrace) speakerMuted = result.speakerMuted;
+        if (!playPauseInGrace) nowPlayingIsPlaying = result.nowPlayingIsPlaying;
         nowPlayingArtist = result.nowPlayingArtist;
         nowPlayingTrack = result.nowPlayingTrack;
         nowPlayingSource = result.nowPlayingSource;
