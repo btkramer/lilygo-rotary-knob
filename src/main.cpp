@@ -707,7 +707,7 @@ uint32_t idleToHomeMs = IDLE_TO_HOME_MS_DEFAULT;
 // is safe even while a label is currently on screen.
 String nowPlayingArtist = "Boards of Canada";
 String nowPlayingTrack = "Roygbiv";
-char nowPlayingElapsed[16] = "1:42";
+char nowPlayingElapsed[24] = "1:42/3:45";
 // Placeholder for the source app (Brian, 2026-08-19, e.g. "YouTube") —
 // SMTC exposes which app owns the active media session once pc-dash-app
 // exists (see ECOSYSTEM_PLAN.md's "YouTube-aware pause vs. mute" section);
@@ -717,13 +717,51 @@ char nowPlayingElapsed[16] = "1:42";
 // track/elapsed above.
 String nowPlayingSource = "YouTube";
 int nowPlayingProgressPercent = 38;
+// Raw ms, kept alongside the derived percent/formatted-string above so
+// loop()'s pcDataChanged check (T23, 2026-08-21) can detect a position-only
+// change even when nothing else about the track did — see that check's own
+// comment.
+uint32_t nowPlayingPositionMs = 0;
+uint32_t nowPlayingDurationMs = 225000;
 
-// mm:ss from a raw ms position — sync poll's granularity (~20s), not a
-// locally-ticking clock; matches the same periodic-reconciliation pattern
-// as volumePercent rather than adding a new per-second timer.
-void formatNowPlayingElapsed(uint32_t ms) {
-  uint32_t totalSeconds = ms / 1000;
-  snprintf(nowPlayingElapsed, sizeof(nowPlayingElapsed), "%u:%02u", totalSeconds / 60, totalSeconds % 60);
+// "current/total" (e.g. "1:23/3:45", T22) from raw ms values — sync poll's
+// granularity (~20s), not a locally-ticking clock; matches the same
+// periodic-reconciliation pattern as volumePercent rather than adding a new
+// per-second timer.
+void formatNowPlayingElapsed(uint32_t positionMs, uint32_t durationMs) {
+  uint32_t posSec = positionMs / 1000;
+  uint32_t durSec = durationMs / 1000;
+  snprintf(nowPlayingElapsed, sizeof(nowPlayingElapsed), "%u:%02u/%u:%02u",
+           posSec / 60, posSec % 60, durSec / 60, durSec % 60);
+}
+
+// T21 (Brian, 2026-08-21): an apostrophe rendered as a solid missing-glyph
+// square on real track titles. SMTC/Windows track metadata commonly uses
+// Unicode curly quotes/dashes (e.g. U+2019 right single quote) rather than
+// plain ASCII, and the built-in LVGL fonts here (lv_font_montserrat_*) only
+// cover a basic Latin glyph range — no extended-punctuation build option was
+// enabled, and rebuilding a custom font atlas is a lot of overhead for this.
+// Normalizing on receipt (firmware side, not pc-dash-app) means any future
+// data source with the same habit is covered too, not just SMTC.
+String normalizeSmartPunctuation(const String &in) {
+  String out;
+  out.reserve(in.length());
+  for (size_t i = 0; i < in.length(); ) {
+    uint8_t c = in[i];
+    if (c == 0xE2 && i + 2 < in.length() && (uint8_t)in[i + 1] == 0x80) {
+      uint8_t c2 = in[i + 2];
+      switch (c2) {
+        case 0x98: case 0x99: out += '\''; i += 3; continue; // ‘ ’
+        case 0x9C: case 0x9D: out += '"';  i += 3; continue; // “ ”
+        case 0x93: case 0x94: out += '-';  i += 3; continue; // – —
+        case 0xA6: out += "...";           i += 3; continue; // …
+        default: break;
+      }
+    }
+    out += (char)c;
+    i++;
+  }
+  return out;
 }
 // No HID readback exists for actual playback state — this is a local guess,
 // toggled optimistically on each play/pause tap, same "local estimate only"
@@ -998,6 +1036,12 @@ void buildNowPlayingScreen(lv_obj_t *scr) {
   // below for the same chord-math pattern at y=91).
   lv_obj_set_width(nowPlayingTrackLabel, 320);
   lv_obj_set_style_text_align(nowPlayingTrackLabel, LV_TEXT_ALIGN_CENTER, 0);
+  // T20 (Brian, 2026-08-21): default circular-scroll speed (LVGL's built-in
+  // LV_LABEL_DEF_SCROLL_SPEED, speed=40) read as too fast on-device. Halving
+  // the speed value doubles scroll duration for any given title's overflow
+  // distance (this is speed, not a fixed duration, so it still scales with
+  // title length rather than making long titles zip by proportionally faster).
+  lv_obj_set_style_anim_duration(nowPlayingTrackLabel, lv_anim_speed_clamped(20, 300, 10000), 0);
   lv_label_set_long_mode(nowPlayingTrackLabel, LV_LABEL_LONG_MODE_SCROLL_CIRCULAR);
   lv_label_set_text(nowPlayingTrackLabel, nowPlayingTrack.c_str());
   lv_obj_align(nowPlayingTrackLabel, LV_ALIGN_CENTER, 0, 61);
@@ -1462,9 +1506,11 @@ bool pollSyncState() {
         result.speakerMuted = pcState["speakerMuted"] | false;
         result.nowPlayingIsPlaying = pcState["nowPlayingIsPlaying"] | false;
         JsonObject nowPlaying = pcState["nowPlaying"];
-        result.nowPlayingTrack = nowPlaying["title"] | "";
-        result.nowPlayingArtist = nowPlaying["artist"] | "";
-        result.nowPlayingSource = nowPlaying["source"] | "";
+        // normalizeSmartPunctuation (T21): title/artist commonly carry
+        // Windows-style curly quotes/dashes the on-device fonts can't render.
+        result.nowPlayingTrack = normalizeSmartPunctuation(String((const char *)(nowPlaying["title"] | "")));
+        result.nowPlayingArtist = normalizeSmartPunctuation(String((const char *)(nowPlaying["artist"] | "")));
+        result.nowPlayingSource = normalizeSmartPunctuation(String((const char *)(nowPlaying["source"] | "")));
         result.nowPlayingPositionMs = nowPlaying["positionMs"] | 0;
         result.nowPlayingDurationMs = nowPlaying["durationMs"] | 0;
         result.ok = true;
@@ -1713,22 +1759,33 @@ void loop() {
       // being overwritten by the hub's never-set defaults.
       bool pcDataChanged = false;
       if (pcConnected) {
+        // T23 (Brian, 2026-08-21): position/duration used to be left out of
+        // this check entirely, so a poll where *only* playback position
+        // advanced (the common case — title/artist/play-state don't change
+        // every 20s poll, position does) never called updateNowPlayingScreen()
+        // below, even though the underlying vars were already being updated
+        // correctly. Screen looked stuck on an old position until something
+        // else (e.g. play/pause) happened to change alongside it.
         pcDataChanged = volumePercent != result.volumePercent ||
                          speakerMuted != result.speakerMuted ||
                          nowPlayingIsPlaying != result.nowPlayingIsPlaying ||
                          nowPlayingArtist != result.nowPlayingArtist ||
                          nowPlayingTrack != result.nowPlayingTrack ||
-                         nowPlayingSource != result.nowPlayingSource;
+                         nowPlayingSource != result.nowPlayingSource ||
+                         nowPlayingPositionMs != result.nowPlayingPositionMs ||
+                         nowPlayingDurationMs != result.nowPlayingDurationMs;
         volumePercent = result.volumePercent;
         speakerMuted = result.speakerMuted;
         nowPlayingIsPlaying = result.nowPlayingIsPlaying;
         nowPlayingArtist = result.nowPlayingArtist;
         nowPlayingTrack = result.nowPlayingTrack;
         nowPlayingSource = result.nowPlayingSource;
-        nowPlayingProgressPercent = result.nowPlayingDurationMs > 0
-            ? constrain((int)(((uint64_t)result.nowPlayingPositionMs * 100) / result.nowPlayingDurationMs), 0, 100)
+        nowPlayingPositionMs = result.nowPlayingPositionMs;
+        nowPlayingDurationMs = result.nowPlayingDurationMs;
+        nowPlayingProgressPercent = nowPlayingDurationMs > 0
+            ? constrain((int)(((uint64_t)nowPlayingPositionMs * 100) / nowPlayingDurationMs), 0, 100)
             : 0;
-        formatNowPlayingElapsed(result.nowPlayingPositionMs);
+        formatNowPlayingElapsed(nowPlayingPositionMs, nowPlayingDurationMs); // T22: now "current/total"
         updateVolumeScreen();
         updateSpeakerMuteScreen();
       }
