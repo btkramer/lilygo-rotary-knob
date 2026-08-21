@@ -730,15 +730,28 @@ int nowPlayingProgressPercent = 38;
 // while paused) — mirrors pc-dash-app's own T25 position-extrapolation fix,
 // one hop further down the pipeline — rather than only ever moving when a
 // poll happens to carry a fresher value (sync poll's granularity, ~1s, was
-// visibly a few seconds behind real playback). Reconciled against the poll's
-// real positionMs/durationMs periodically (see POSITION_RECONCILE_INTERVAL_MS)
-// to correct drift, not on every single poll — see loop()'s own comment.
+// visibly a few seconds behind real playback).
+//
+// Reconciliation (2026-08-21, Brian's design): rather than blindly snapping
+// to whatever a single poll says on a flat timer (original T29 approach,
+// `POSITION_RECONCILE_INTERVAL_MS`, since replaced), a poll's position is
+// only trusted as a real correction once it disagrees with this local clock
+// by more than `POSITION_DRIFT_TOLERANCE_MS` on `POSITION_DRIFT_CONFIRM_COUNT`
+// *consecutive* polls — one noisy/glitchy poll can't yank the display, but a
+// genuine, sustained drift still corrects within a couple of poll cycles.
+// Unlike the equivalent idea for nowPlayingIsPlaying (deliberately NOT
+// applied there — see loop()'s own comment on why a boolean field can't
+// distinguish "real but slow to confirm" from "never happening" this way),
+// position doesn't have that ambiguity: it's continuously reported based on
+// real elapsed playback time, not a discrete pending transition, so there's
+// no equivalent "legitimately unconfirmed" state to misfire on.
 uint32_t nowPlayingPositionMs = 0;
 uint32_t nowPlayingDurationMs = 225000;
-uint32_t lastPositionTickMs = 0;      // millis() the local clock last advanced by one tick
-uint32_t lastPositionReconcileMs = 0; // millis() position/duration were last snapped from a poll
+uint32_t lastPositionTickMs = 0; // millis() the local clock last advanced by one tick
+uint32_t positionDriftStreak = 0; // consecutive polls in a row disagreeing with the local clock by more than tolerance
 constexpr uint32_t POSITION_TICK_MS = 1000;
-constexpr uint32_t POSITION_RECONCILE_INTERVAL_MS = 4000;
+constexpr uint32_t POSITION_DRIFT_TOLERANCE_MS = 1500; // normal poll/network jitter shouldn't count as real drift
+constexpr uint32_t POSITION_DRIFT_CONFIRM_COUNT = 2;
 
 // "current/total" (e.g. "1:23/3:45", T22) from raw ms values.
 void formatNowPlayingElapsed(uint32_t positionMs, uint32_t durationMs) {
@@ -1448,11 +1461,28 @@ constexpr uint32_t SYNC_HTTP_TIMEOUT_MS = 4000;
 // real confirmation arriving, whenever it actually does). The backstop
 // itself is a last-resort safety net for a genuinely wrong local guess (e.g.
 // an HID command that silently didn't register), not the primary
-// reconciliation path, so it's set generously long — 30000ms. This is a
-// firmware-side mitigation, not a fix for whatever's making the real
-// backend confirmation slow in the first place; see the pc-dash coordinator
-// for pc-dash-app's parallel investigation into that.
-constexpr uint32_t LOCAL_OPTIMISTIC_BACKSTOP_MS = 30000;
+// reconciliation path. This is a firmware-side mitigation, not a fix for
+// whatever's making the real backend confirmation slow in the first place;
+// see the pc-dash coordinator for pc-dash-app's parallel investigation into
+// that.
+//
+// Considered a 2-consecutive-agreement rule here too (like position's own,
+// below) — deliberately not applied: for a boolean field, "poll disagrees
+// with local" and "poll agrees with the OTHER possible value" are the same
+// condition, so it can't distinguish a real-but-slow confirmation from a
+// wrong local guess the way it can for position (which is continuously
+// reported, not a discrete pending transition — see position's own
+// comment). Either failure mode produces an identical poll sequence here.
+//
+// 5000ms (2026-08-21, Brian's call, down from 30000ms): a knowing tradeoff,
+// not a new finding — favors fast self-correction of a wrong local guess
+// over holding out for a slow-but-real confirmation. Accepted risk: a real
+// change taking longer than 5s to confirm (SMTC's play-state lag has no
+// fixed ceiling — see T29's investigation) will occasionally get reverted
+// and then re-applied once the real confirmation actually lands, rather
+// than holding steady the whole time. Revisit the number, not the shape, if
+// that tradeoff stops feeling right.
+constexpr uint32_t LOCAL_OPTIMISTIC_BACKSTOP_MS = 5000;
 
 Preferences syncPrefs; // only ever touched from syncPollTask post-refactor — see setupSyncSettings()'s comment
 // Whether the *poll itself* reached pc-dash-hub and got a parseable 200 —
@@ -1890,21 +1920,31 @@ void loop() {
           // see 1000ms of unbroken elapsed time between resets).
           if (playPauseChanged) lastPositionTickMs = nowMs;
         }
+        bool trackChanged = nowPlayingArtist != result.nowPlayingArtist ||
+                             nowPlayingTrack != result.nowPlayingTrack ||
+                             nowPlayingSource != result.nowPlayingSource;
         nowPlayingArtist = result.nowPlayingArtist;
         nowPlayingTrack = result.nowPlayingTrack;
         nowPlayingSource = result.nowPlayingSource;
 
-        // T29: reconcile the locally-ticking position/duration against the
-        // poll's real values periodically (not every ~1s poll — see
-        // POSITION_RECONCILE_INTERVAL_MS's own comment), except right on the
-        // connect transition, where waiting even a few seconds to show real
-        // data instead of the placeholder/last-known value isn't worth it.
+        // Reconcile the locally-ticking position/duration against the poll's
+        // real values (Brian's design, 2026-08-21) — see this field's own
+        // top-of-file comment for the full reasoning. Applied immediately on
+        // the connect transition or a track change (no reason to wait —
+        // there's no "might just be slow to confirm" ambiguity in either
+        // case, unlike play/pause), otherwise only once the poll has
+        // disagreed with the local clock by more than the tolerance on
+        // POSITION_DRIFT_CONFIRM_COUNT consecutive polls, so one noisy poll
+        // can't visibly yank the display.
         bool justConnected = !wasPcConnected;
-        if (justConnected || (nowMs - lastPositionReconcileMs) >= POSITION_RECONCILE_INTERVAL_MS) {
+        int32_t positionDiffMs = (int32_t)result.nowPlayingPositionMs - (int32_t)nowPlayingPositionMs;
+        bool positionDrifted = (uint32_t)abs(positionDiffMs) > POSITION_DRIFT_TOLERANCE_MS;
+        positionDriftStreak = positionDrifted ? positionDriftStreak + 1 : 0;
+        if (justConnected || trackChanged || positionDriftStreak >= POSITION_DRIFT_CONFIRM_COUNT) {
           nowPlayingPositionMs = result.nowPlayingPositionMs;
           nowPlayingDurationMs = result.nowPlayingDurationMs;
-          lastPositionReconcileMs = nowMs;
           lastPositionTickMs = nowMs;
+          positionDriftStreak = 0;
           nowPlayingProgressPercent = nowPlayingDurationMs > 0
               ? constrain((int)(((uint64_t)nowPlayingPositionMs * 100) / nowPlayingDurationMs), 0, 100)
               : 0;
