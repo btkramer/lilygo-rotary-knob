@@ -699,9 +699,14 @@ constexpr uint32_t NOW_PLAYING_ACCENT_COLOR = 0x4FB477; // same green as the moc
 // Operator-adjustable from the Docker app, same as volumeFuseMs above.
 constexpr uint32_t IDLE_TO_HOME_MS_DEFAULT = 30000; // standard non-Home idle timeout, see PROGRESS.md
 uint32_t idleToHomeMs = IDLE_TO_HOME_MS_DEFAULT;
-const char *nowPlayingArtist = "Boards of Canada";
-const char *nowPlayingTrack = "Roygbiv";
-const char *nowPlayingElapsed = "1:42";
+// Defaults shown until the first pcConnected poll reconciles them (see
+// loop()'s sync-apply step) — String, not const char*, so a real synced
+// value (arbitrary length, e.g. actual SMTC track titles) can replace them.
+// lv_label_set_text() copies internally, so re-pointing these on every poll
+// is safe even while a label is currently on screen.
+String nowPlayingArtist = "Boards of Canada";
+String nowPlayingTrack = "Roygbiv";
+char nowPlayingElapsed[16] = "1:42";
 // Placeholder for the source app (Brian, 2026-08-19, e.g. "YouTube") —
 // SMTC exposes which app owns the active media session once pc-dash-app
 // exists (see ECOSYSTEM_PLAN.md's "YouTube-aware pause vs. mute" section);
@@ -709,8 +714,16 @@ const char *nowPlayingElapsed = "1:42";
 // browser itself unless the site's own Media Session metadata disambiguates
 // it further. Same "no companion app yet" placeholder pattern as artist/
 // track/elapsed above.
-const char *nowPlayingSource = "YouTube";
+String nowPlayingSource = "YouTube";
 int nowPlayingProgressPercent = 38;
+
+// mm:ss from a raw ms position — sync poll's granularity (~20s), not a
+// locally-ticking clock; matches the same periodic-reconciliation pattern
+// as volumePercent rather than adding a new per-second timer.
+void formatNowPlayingElapsed(uint32_t ms) {
+  uint32_t totalSeconds = ms / 1000;
+  snprintf(nowPlayingElapsed, sizeof(nowPlayingElapsed), "%u:%02u", totalSeconds / 60, totalSeconds % 60);
+}
 // No HID readback exists for actual playback state — this is a local guess,
 // toggled optimistically on each play/pause tap, same "local estimate only"
 // pattern as volumePercent/speakerMuted. Icon shows the action a tap will
@@ -739,6 +752,10 @@ lv_obj_t *nowPlayingNextGlow;
 void updateNowPlayingScreen() {
   lv_arc_set_value(nowPlayingArc, nowPlayingProgressPercent);
   lv_label_set_text(nowPlayingIcon, nowPlayingIsPlaying ? LV_SYMBOL_PAUSE : LV_SYMBOL_PLAY);
+  lv_label_set_text(nowPlayingSourceLabel, nowPlayingSource.c_str());
+  lv_label_set_text(nowPlayingArtistLabel, nowPlayingArtist.c_str());
+  lv_label_set_text(nowPlayingTrackLabel, nowPlayingTrack.c_str());
+  lv_label_set_text(nowPlayingElapsedLabel, nowPlayingElapsed);
 
   // Same PC-offline dim treatment as Home (see pcConnected's own comment and
   // PC_OFFLINE_DIM_ENABLED, currently suppressing it for testing) —
@@ -906,7 +923,7 @@ void buildNowPlayingScreen(lv_obj_t *scr) {
   nowPlayingSourceLabel = lv_label_create(scr);
   lv_obj_set_style_text_font(nowPlayingSourceLabel, &lv_font_montserrat_24, 0);
   lv_obj_set_style_text_color(nowPlayingSourceLabel, lv_color_hex(NOW_PLAYING_ACCENT_COLOR), 0);
-  lv_label_set_text(nowPlayingSourceLabel, nowPlayingSource);
+  lv_label_set_text(nowPlayingSourceLabel, nowPlayingSource.c_str());
   lv_obj_align(nowPlayingSourceLabel, LV_ALIGN_CENTER, 0, -85);
 
   // Layout, revised again (Brian, 2026-08-19): the prior pass put the
@@ -956,7 +973,7 @@ void buildNowPlayingScreen(lv_obj_t *scr) {
   nowPlayingArtistLabel = lv_label_create(scr);
   lv_obj_set_style_text_font(nowPlayingArtistLabel, &lv_font_montserrat_28, 0);
   lv_obj_set_style_text_color(nowPlayingArtistLabel, lv_color_hex(0xE7ECE9), 0);
-  lv_label_set_text(nowPlayingArtistLabel, nowPlayingArtist);
+  lv_label_set_text(nowPlayingArtistLabel, nowPlayingArtist.c_str());
   lv_obj_align(nowPlayingArtistLabel, LV_ALIGN_CENTER, 0, 25);
 
   // Fonts bumped one step each (Brian, 2026-08-19, third pass). Gaps pulled
@@ -970,7 +987,7 @@ void buildNowPlayingScreen(lv_obj_t *scr) {
   nowPlayingTrackLabel = lv_label_create(scr);
   lv_obj_set_style_text_font(nowPlayingTrackLabel, &lv_font_montserrat_28, 0);
   lv_obj_set_style_text_color(nowPlayingTrackLabel, lv_color_hex(0x9AA5A3), 0);
-  lv_label_set_text(nowPlayingTrackLabel, nowPlayingTrack);
+  lv_label_set_text(nowPlayingTrackLabel, nowPlayingTrack.c_str());
   lv_obj_align(nowPlayingTrackLabel, LV_ALIGN_CENTER, 0, 61);
 
   nowPlayingElapsedLabel = lv_label_create(scr);
@@ -1335,6 +1352,18 @@ struct SyncResult {
   uint32_t lastSeenSecondsAgo;
   uint32_t volumeFuseMs;
   uint32_t idleToHomeMs;
+  // pcState's volume/mute/now-playing fields (T14, 2026-08-21) — parsed
+  // unconditionally below, but loop() only ever applies them when
+  // result.pcConnected is true (see loop()'s sync-apply step and
+  // ECOSYSTEM_PLAN.md's "Volume/mute/media reconciliation" section).
+  int volumePercent;
+  bool speakerMuted;
+  bool nowPlayingIsPlaying;
+  String nowPlayingArtist;
+  String nowPlayingTrack;
+  String nowPlayingSource;
+  uint32_t nowPlayingPositionMs;
+  uint32_t nowPlayingDurationMs;
 };
 SyncResult pendingSyncResult;
 
@@ -1373,6 +1402,19 @@ bool pollSyncState() {
   result.idleToHomeMs = idleToHomeMs;
   result.pcConnected = false;
   result.lastSeenSecondsAgo = 0;
+  // Left at these neutral defaults (not read from the local globals — those
+  // are also written by loop()/ISR code on this same board, so avoiding a
+  // cross-task read here is simpler than reasoning about the race) on a
+  // failed/unparseable poll; harmless since loop() only ever applies these
+  // fields when result.pcConnected is true anyway.
+  result.volumePercent = 0;
+  result.speakerMuted = false;
+  result.nowPlayingIsPlaying = false;
+  result.nowPlayingArtist = "";
+  result.nowPlayingTrack = "";
+  result.nowPlayingSource = "";
+  result.nowPlayingPositionMs = 0;
+  result.nowPlayingDurationMs = 0;
   result.ok = false;
 
   if (WiFi.status() == WL_CONNECTED) {
@@ -1395,15 +1437,24 @@ bool pollSyncState() {
           if (result.volumeFuseMs != volumeFuseMs) syncPrefs.putUInt("volFuseMs", result.volumeFuseMs);
           if (result.idleToHomeMs != idleToHomeMs) syncPrefs.putUInt("idleMs", result.idleToHomeMs);
         }
-        // Real volume/mute/now-playing values will ride in pcState once
-        // pc-dash-app (step 4, not built yet) starts reporting them —
-        // pc-dash-hub returns pcConnected as a static stub today (always
-        // false), so volumePercent/speakerMuted/nowPlayingIsPlaying stay
-        // local-estimate-only for now regardless of what this poll returns
-        // (see each var's own comment). Nothing to reconcile against until
-        // pc-dash-app exists.
-        result.pcConnected = doc["pcState"]["pcConnected"] | false;
-        result.lastSeenSecondsAgo = doc["pcState"]["lastSeenSecondsAgo"] | 0;
+        // pc-dash-app (step 4) is live now (2026-08-20) — pcState carries
+        // real volume/mute/now-playing values, reconciled against the local
+        // knob-driven estimate in loop() once pcConnected is true (T14,
+        // 2026-08-21; see each var's own comment for the prior placeholder
+        // state, and ECOSYSTEM_PLAN.md's "Volume/mute/media reconciliation"
+        // section for the design this implements).
+        JsonObject pcState = doc["pcState"];
+        result.pcConnected = pcState["pcConnected"] | false;
+        result.lastSeenSecondsAgo = pcState["lastSeenSecondsAgo"] | 0;
+        result.volumePercent = pcState["volumePercent"] | 0;
+        result.speakerMuted = pcState["speakerMuted"] | false;
+        result.nowPlayingIsPlaying = pcState["nowPlayingIsPlaying"] | false;
+        JsonObject nowPlaying = pcState["nowPlaying"];
+        result.nowPlayingTrack = nowPlaying["title"] | "";
+        result.nowPlayingArtist = nowPlaying["artist"] | "";
+        result.nowPlayingSource = nowPlaying["source"] | "";
+        result.nowPlayingPositionMs = nowPlaying["positionMs"] | 0;
+        result.nowPlayingDurationMs = nowPlaying["durationMs"] | 0;
         result.ok = true;
       }
     }
@@ -1547,7 +1598,36 @@ void loop() {
       lastSeenSecondsAgo = result.lastSeenSecondsAgo;
       volumeFuseMs = result.volumeFuseMs;
       idleToHomeMs = result.idleToHomeMs;
-      if (pcConnected != wasPcConnected) {
+
+      // Volume/mute/now-playing: only trust the payload once the companion
+      // app has actually reported in on *this* poll (result.pcConnected) —
+      // see ECOSYSTEM_PLAN.md's "Volume/mute/media reconciliation" section.
+      // While disconnected, the local optimistic estimate (set by knob
+      // rotation / button press / tap) is left uncorrected rather than
+      // being overwritten by the hub's never-set defaults.
+      bool pcDataChanged = false;
+      if (pcConnected) {
+        pcDataChanged = volumePercent != result.volumePercent ||
+                         speakerMuted != result.speakerMuted ||
+                         nowPlayingIsPlaying != result.nowPlayingIsPlaying ||
+                         nowPlayingArtist != result.nowPlayingArtist ||
+                         nowPlayingTrack != result.nowPlayingTrack ||
+                         nowPlayingSource != result.nowPlayingSource;
+        volumePercent = result.volumePercent;
+        speakerMuted = result.speakerMuted;
+        nowPlayingIsPlaying = result.nowPlayingIsPlaying;
+        nowPlayingArtist = result.nowPlayingArtist;
+        nowPlayingTrack = result.nowPlayingTrack;
+        nowPlayingSource = result.nowPlayingSource;
+        nowPlayingProgressPercent = result.nowPlayingDurationMs > 0
+            ? constrain((int)(((uint64_t)result.nowPlayingPositionMs * 100) / result.nowPlayingDurationMs), 0, 100)
+            : 0;
+        formatNowPlayingElapsed(result.nowPlayingPositionMs);
+        updateVolumeScreen();
+        updateSpeakerMuteScreen();
+      }
+
+      if (pcConnected != wasPcConnected || pcDataChanged) {
         updateHomeScreen();
         updateNowPlayingScreen();
       }
