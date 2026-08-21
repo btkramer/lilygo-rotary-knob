@@ -1896,19 +1896,48 @@ void loop() {
   // catch-up while-loop): loop() runs far more often than once a second for
   // LVGL rendering, so falling behind (e.g. a brief stall) is caught up
   // within a handful of iterations, not a visible jump. Frozen (anchor reset
-  // to "now", no backlog accrued) whenever not actually advancing — paused,
-  // disconnected, or no real duration yet — so resuming playback later never
-  // bursts forward by however long it was paused.
-  if (pcConnected && nowPlayingIsPlaying && nowPlayingDurationMs > 0) {
-    if (millis() - lastPositionTickMs >= POSITION_TICK_MS && nowPlayingPositionMs < nowPlayingDurationMs) {
+  // to "now", no backlog accrued) whenever not actually advancing — paused or
+  // disconnected — so resuming playback later never bursts forward by however
+  // long it was paused.
+  //
+  // Correction (2026-08-21): the first version of this also required
+  // nowPlayingDurationMs > 0 to tick at all, on top of pcConnected/
+  // nowPlayingIsPlaying — Brian reported the local clock not visibly running
+  // at all (only the ~4s reconcile snap moved anything), which durationMs
+  // legitimately being 0 for some sources (not every SMTC session reports a
+  // track length) would fully explain: current position should still count
+  // up even when the total is unknown, per the original ask, so gate only on
+  // the two fields that actually mean "is real playback progressing" —
+  // duration now only affects the cap/percent, both already guarded for 0
+  // separately.
+  if (pcConnected && nowPlayingIsPlaying) {
+    if (millis() - lastPositionTickMs >= POSITION_TICK_MS &&
+        (nowPlayingDurationMs == 0 || nowPlayingPositionMs < nowPlayingDurationMs)) {
       lastPositionTickMs += POSITION_TICK_MS;
-      nowPlayingPositionMs = min(nowPlayingPositionMs + POSITION_TICK_MS, nowPlayingDurationMs);
-      nowPlayingProgressPercent = constrain((int)(((uint64_t)nowPlayingPositionMs * 100) / nowPlayingDurationMs), 0, 100);
+      nowPlayingPositionMs = nowPlayingDurationMs > 0
+          ? min(nowPlayingPositionMs + POSITION_TICK_MS, nowPlayingDurationMs)
+          : nowPlayingPositionMs + POSITION_TICK_MS;
+      nowPlayingProgressPercent = nowPlayingDurationMs > 0
+          ? constrain((int)(((uint64_t)nowPlayingPositionMs * 100) / nowPlayingDurationMs), 0, 100)
+          : 0;
       formatNowPlayingElapsed(nowPlayingPositionMs, nowPlayingDurationMs);
       updateNowPlayingScreen();
     }
   } else {
     lastPositionTickMs = millis();
+  }
+
+  // Debug aid (2026-08-21): prints the tick gate's own inputs every 5s so a
+  // WebSerial/serial capture during a live test can show definitively
+  // whether pcConnected/nowPlayingIsPlaying/durationMs were what's actually
+  // blocking it, rather than guessing again from another report alone.
+  static uint32_t lastPositionTickDebugMs = 0;
+  if (millis() - lastPositionTickDebugMs >= 5000) {
+    lastPositionTickDebugMs = millis();
+    Serial.printf("posTick: pcConnected=%d playing=%d pos=%ums dur=%ums\n",
+                  pcConnected, nowPlayingIsPlaying, nowPlayingPositionMs, nowPlayingDurationMs);
+    WebSerial.printf("posTick: pcConnected=%d playing=%d pos=%ums dur=%ums\n",
+                      pcConnected, nowPlayingIsPlaying, nowPlayingPositionMs, nowPlayingDurationMs);
   }
 
   // LVGL now owns touch reads (via lvTouchpadRead(), called through this) —
