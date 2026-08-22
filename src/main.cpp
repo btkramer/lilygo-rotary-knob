@@ -165,6 +165,13 @@ void lvDispFlush(lv_display_t *disp, const lv_area_t *area, uint8_t *px_map) {
   lv_disp_flush_ready(disp);
 }
 
+// T30 fix (2026-08-22): incremented on every PRESSED edge (see below).
+// screenCycleGestureCb() uses this to recognize "I already handled a
+// gesture for this exact touch-down" and ignore a second LV_EVENT_GESTURE
+// dispatch for the same physical touch — see that function's own comment
+// for the live-capture evidence this fix is based on.
+uint32_t touchPressCounter = 0;
+
 void lvTouchpadRead(lv_indev_t *indev, lv_indev_data_t *data) {
   // Deliberately does NOT gate on touch.isPressed(): with an IRQ pin
   // configured (ours is, see setupTouch()), that call does a raw
@@ -203,6 +210,7 @@ void lvTouchpadRead(lv_indev_t *indev, lv_indev_data_t *data) {
   static lv_indev_state_t lastLoggedTouchState = LV_INDEV_STATE_RELEASED;
   if (newState != lastLoggedTouchState) {
     lastLoggedTouchState = newState;
+    if (newState == LV_INDEV_STATE_PRESSED) touchPressCounter++; // T30 fix, see its own comment above
     Serial.printf("touchEdge: t=%ums %s\n", millis(), newState == LV_INDEV_STATE_PRESSED ? "PRESSED" : "RELEASED");
     WebSerial.printf("touchEdge: t=%ums %s\n", millis(), newState == LV_INDEV_STATE_PRESSED ? "PRESSED" : "RELEASED");
   }
@@ -365,9 +373,13 @@ lv_obj_t *volumeScreen;
 // Declared together with volumeScreen (rather than where each is actually
 // built, further down) so the return-screen variables below can reference
 // all three transient screens even though Speaker Mute's and Quick-jump's
-// own build code comes later in the file.
+// own build code comes later in the file. nowPlayingScreen and
+// lastNowPlayingActivityMs (moved up here 2026-08-22, T35 fix) join them
+// for the same reason: restoreScreen() below needs both.
 lv_obj_t *speakerMuteScreen;
 lv_obj_t *quickJumpScreen;
+lv_obj_t *nowPlayingScreen;
+uint32_t lastNowPlayingActivityMs = 0;
 lv_obj_t *volumeArc;
 lv_obj_t *volumeMuteIcon; // LV_SYMBOL_MUTE label, shown only at 0%
 lv_obj_t *volumeWaveIcon; // single image widget, src swapped per tier
@@ -427,6 +439,17 @@ void restoreScreen(lv_obj_t *target) {
   if (target == volumeScreen) lastVolumeActivityMs = now;
   else if (target == speakerMuteScreen) lastSpeakerMuteActivityMs = now;
   else if (target == quickJumpScreen) lastQuickJumpActivityMs = now;
+  // T35 fix (2026-08-22): nowPlayingScreen was missing from this list.
+  // Confirmed via live capture the real bug this caused: Quick-jump's own
+  // 8s auto-return fuse (QUICK_JUMP_RETURN_MS) calls restoreScreen() to
+  // land back on Now Playing if that's where Quick-jump was opened from —
+  // without this branch, lastNowPlayingActivityMs stayed at whatever it
+  // was *before* the Quick-jump detour, so the very next check of Now
+  // Playing's own idle fuse (see loop()) could already be past even the
+  // shorter NOW_PLAYING_STOPPED_IDLE_MS threshold, firing near-instantly
+  // instead of giving a real fresh window — this is what made T34's
+  // playing/stopped switch look like it wasn't taking effect.
+  else if (target == nowPlayingScreen) lastNowPlayingActivityMs = now;
 }
 
 // Same blue used for the ring, the "VOLUME" caption, and the icon — matches
@@ -819,9 +842,9 @@ String normalizeSmartPunctuation(const String &in) {
 // different, well-established UI vocabulary.
 bool nowPlayingIsPlaying = true;
 uint32_t lastPlayPauseLocalWriteMs = 0; // T28 — see lastVolumeLocalWriteMs's comment
-uint32_t lastNowPlayingActivityMs = 0;
+// nowPlayingScreen and lastNowPlayingActivityMs now declared up with
+// homeScreen/volumeScreen (see that comment) — restoreScreen() needs them.
 
-lv_obj_t *nowPlayingScreen; // declared here (not up with the other screens) since it's built later in file order
 lv_obj_t *nowPlayingArc;
 lv_obj_t *nowPlayingIcon;
 lv_obj_t *nowPlayingPrevIcon;
@@ -1301,18 +1324,29 @@ void screenCycleGestureCb(lv_event_t *e) {
   lv_indev_t *indev = lv_indev_active();
   if (!indev) return;
   lv_dir_t dir = lv_indev_get_gesture_dir(indev);
-  // T30 debug instrumentation (2026-08-22, temporary — remove once T30's root
-  // cause is confirmed or ruled out): logs every dispatch of this callback —
-  // including ones that bail below — so a WebSerial/serial capture during a
-  // live repro can show whether one physical swipe fires this more than
-  // once (this project's leading unconfirmed theory), and if so, with what
-  // direction/screen each time. Low frequency (once per gesture at most, per
-  // LVGL's own one-shot dispatch — see lv_indev.c's gesture_sent guard), so
-  // unconditional logging here is fine, unlike the touch-edge log above.
+  // T30 root cause CONFIRMED (2026-08-22) via two live WebSerial captures:
+  // a single physical swipe dispatched this callback TWICE (same dir,
+  // ~60-75ms apart, activeBefore differing between the two calls — the
+  // second one already reflecting the screen change the first one made),
+  // despite this file's prior belief that LVGL's gesture_sent guard makes
+  // dispatch one-shot per gesture. Since this function is a strict
+  // Home<->NowPlaying toggle, a spurious second dispatch for the same
+  // swipe immediately undoes whatever the first one just did — exactly
+  // Brian's "flashes to the new screen, then reverts" symptom. Fixed below
+  // by ignoring a second dispatch for the same physical touch-down
+  // (touchPressCounter, bumped once per PRESSED edge in lvTouchpadRead()),
+  // rather than chasing why LVGL sends it twice. Debug logging (every
+  // dispatch, including bailed ones) kept for now to confirm the fix
+  // actually suppresses the duplicate on the next live retest — remove
+  // once confirmed.
+  static uint32_t lastHandledPressCounter = 0;
+  bool duplicateForThisTouch = touchPressCounter == lastHandledPressCounter;
   lv_obj_t *activeBefore = lv_screen_active();
-  Serial.printf("gestureCb: t=%ums dir=%d activeBefore=%p\n", millis(), (int)dir, (void *)activeBefore);
-  WebSerial.printf("gestureCb: t=%ums dir=%d activeBefore=%p\n", millis(), (int)dir, (void *)activeBefore);
+  Serial.printf("gestureCb: t=%ums dir=%d activeBefore=%p dup=%d\n", millis(), (int)dir, (void *)activeBefore, duplicateForThisTouch);
+  WebSerial.printf("gestureCb: t=%ums dir=%d activeBefore=%p dup=%d\n", millis(), (int)dir, (void *)activeBefore, duplicateForThisTouch);
   if (dir != LV_DIR_LEFT && dir != LV_DIR_RIGHT) return;
+  if (duplicateForThisTouch) return;
+  lastHandledPressCounter = touchPressCounter;
   lv_obj_t *active = lv_screen_active();
   if (active == homeScreen) {
     showNowPlayingScreen();
@@ -2168,7 +2202,28 @@ void loop() {
   // specifically this screen's own idle fuse, not the nav-cycle or volume
   // overlay's (separate, already-settled T31/T33 timeouts).
   uint32_t nowPlayingIdleMs = nowPlayingIsPlaying ? idleToHomeMs : NOW_PLAYING_STOPPED_IDLE_MS;
+  // T35 debug (2026-08-22, temporary): Brian reports this fuse isn't
+  // actually switching between the two durations on-device. Throttled
+  // (2s) rather than every loop() — only fires while this screen is
+  // active, so it's silent everywhere else. Shows the exact inputs
+  // (nowPlayingIsPlaying, the resolved threshold, elapsed-since-activity)
+  // so a live capture can confirm whether nowPlayingIsPlaying itself is
+  // wrong at this point, or the threshold picked from it is. Remove once
+  // T35 is root-caused or ruled out.
+  if (lv_screen_active() == nowPlayingScreen) {
+    static uint32_t lastNowPlayingFuseDebugMs = 0;
+    uint32_t nowMs = millis();
+    if (nowMs - lastNowPlayingFuseDebugMs >= 2000) {
+      lastNowPlayingFuseDebugMs = nowMs;
+      Serial.printf("nowPlayingFuse: t=%ums playing=%d idleMs=%u elapsed=%ums\n",
+                    nowMs, nowPlayingIsPlaying, nowPlayingIdleMs, nowMs - lastNowPlayingActivityMs);
+      WebSerial.printf("nowPlayingFuse: t=%ums playing=%d idleMs=%u elapsed=%ums\n",
+                        nowMs, nowPlayingIsPlaying, nowPlayingIdleMs, nowMs - lastNowPlayingActivityMs);
+    }
+  }
   if (lv_screen_active() == nowPlayingScreen && (millis() - lastNowPlayingActivityMs) > nowPlayingIdleMs) {
+    Serial.printf("nowPlayingFuse: FIRED t=%ums playing=%d idleMs=%u\n", millis(), nowPlayingIsPlaying, nowPlayingIdleMs);
+    WebSerial.printf("nowPlayingFuse: FIRED t=%ums playing=%d idleMs=%u\n", millis(), nowPlayingIsPlaying, nowPlayingIdleMs);
     lv_screen_load(homeScreen);
   }
 
