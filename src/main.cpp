@@ -724,6 +724,11 @@ constexpr uint32_t NOW_PLAYING_ACCENT_COLOR = 0x4FB477; // same green as the moc
 // Operator-adjustable from the Docker app, same as volumeFuseMs above.
 constexpr uint32_t IDLE_TO_HOME_MS_DEFAULT = 30000; // standard non-Home idle timeout, see PROGRESS.md
 uint32_t idleToHomeMs = IDLE_TO_HOME_MS_DEFAULT;
+// T34 (2026-08-22): Now Playing's own idle-to-Home fuse specifically, used
+// only while nowPlayingIsPlaying is false (paused/stopped) — see loop()'s
+// own comment on this. Not operator-adjustable like idleToHomeMs/volumeFuseMs
+// (no request for that yet); a plain hardcoded constant until it is.
+constexpr uint32_t NOW_PLAYING_STOPPED_IDLE_MS = 5000;
 // Defaults shown until the first pcConnected poll reconciles them (see
 // loop()'s sync-apply step) — String, not const char*, so a real synced
 // value (arbitrary length, e.g. actual SMTC track titles) can replace them.
@@ -2153,7 +2158,17 @@ void loop() {
   // (see PROGRESS.md's design rules: the standard 30s-idle-to-Home rule for
   // any non-Home screen, first real implementation of it since Now Playing
   // is the first non-overlay non-Home screen to exist).
-  if (lv_screen_active() == nowPlayingScreen && (millis() - lastNowPlayingActivityMs) > idleToHomeMs) {
+  //
+  // T34 (Brian, 2026-08-22): while actually playing, keeps the standard
+  // idleToHomeMs (30s default, operator-adjustable) — nothing changes there.
+  // While paused/stopped, a much shorter fixed 5s takes over instead: once
+  // there's nothing playing, lingering on this screen has little value, so
+  // it falls back to Home quickly rather than waiting out the same timeout
+  // as an actively-playing session. Confirmed with the coordinator this is
+  // specifically this screen's own idle fuse, not the nav-cycle or volume
+  // overlay's (separate, already-settled T31/T33 timeouts).
+  uint32_t nowPlayingIdleMs = nowPlayingIsPlaying ? idleToHomeMs : NOW_PLAYING_STOPPED_IDLE_MS;
+  if (lv_screen_active() == nowPlayingScreen && (millis() - lastNowPlayingActivityMs) > nowPlayingIdleMs) {
     lv_screen_load(homeScreen);
   }
 
