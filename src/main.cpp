@@ -179,17 +179,33 @@ void lvTouchpadRead(lv_indev_t *indev, lv_indev_data_t *data) {
   // removed — see PROGRESS.md). getTouchPoints() does a genuine fresh I2C
   // register read every call, independent of the interrupt pin, so it alone
   // is enough to detect press state reliably.
+  lv_indev_state_t newState = LV_INDEV_STATE_RELEASED;
   if (touchOk) {
     TouchPoints points = touch.getTouchPoints();
     if (points.hasPoints()) {
       const TouchPoint &p = points.getPoint(0);
-      data->state = LV_INDEV_STATE_PRESSED;
+      newState = LV_INDEV_STATE_PRESSED;
       data->point.x = p.x;
       data->point.y = p.y;
-      return;
     }
   }
-  data->state = LV_INDEV_STATE_RELEASED;
+  data->state = newState;
+
+  // T30 debug instrumentation (2026-08-22, temporary — remove once T30's root
+  // cause is confirmed or ruled out): edge-triggered log of every press/
+  // release transition, so a WebSerial/serial capture during a live repro can
+  // show whether a single physical swipe actually produces more than one
+  // press-release cycle (a genuine touch-sensing blip mid-swipe, this
+  // project's leading unconfirmed theory for T30 — see PROGRESS.md/
+  // coordinator-reports/pc-dash.md). Logging every ~30ms poll unconditionally
+  // would be far too spammy to read live; logging only on the state actually
+  // changing keeps this readable while still catching a real blip.
+  static lv_indev_state_t lastLoggedTouchState = LV_INDEV_STATE_RELEASED;
+  if (newState != lastLoggedTouchState) {
+    lastLoggedTouchState = newState;
+    Serial.printf("touchEdge: t=%ums %s\n", millis(), newState == LV_INDEV_STATE_PRESSED ? "PRESSED" : "RELEASED");
+    WebSerial.printf("touchEdge: t=%ums %s\n", millis(), newState == LV_INDEV_STATE_PRESSED ? "PRESSED" : "RELEASED");
+  }
 }
 
 // One ring = a dim full-circle "track" plus a colored value arc, swept
@@ -1280,6 +1296,17 @@ void screenCycleGestureCb(lv_event_t *e) {
   lv_indev_t *indev = lv_indev_active();
   if (!indev) return;
   lv_dir_t dir = lv_indev_get_gesture_dir(indev);
+  // T30 debug instrumentation (2026-08-22, temporary — remove once T30's root
+  // cause is confirmed or ruled out): logs every dispatch of this callback —
+  // including ones that bail below — so a WebSerial/serial capture during a
+  // live repro can show whether one physical swipe fires this more than
+  // once (this project's leading unconfirmed theory), and if so, with what
+  // direction/screen each time. Low frequency (once per gesture at most, per
+  // LVGL's own one-shot dispatch — see lv_indev.c's gesture_sent guard), so
+  // unconditional logging here is fine, unlike the touch-edge log above.
+  lv_obj_t *activeBefore = lv_screen_active();
+  Serial.printf("gestureCb: t=%ums dir=%d activeBefore=%p\n", millis(), (int)dir, (void *)activeBefore);
+  WebSerial.printf("gestureCb: t=%ums dir=%d activeBefore=%p\n", millis(), (int)dir, (void *)activeBefore);
   if (dir != LV_DIR_LEFT && dir != LV_DIR_RIGHT) return;
   lv_obj_t *active = lv_screen_active();
   if (active == homeScreen) {
