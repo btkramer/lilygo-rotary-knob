@@ -399,10 +399,23 @@ int32_t utcOffsetMinutes = 0;
 String timeZoneName = "";
 
 // Burn-in-mitigation idle screen (T40, 2026-08-25). Visual treatment redone
-// for T41 (2026-08-25), T42 (2026-08-26), and T43 (2026-08-26) — each round
-// Brian's own direct feedback after living with the previous one on the
-// physical device. See ECOSYSTEM_PLAN.md's "Burn-in mitigation" section for
-// the original design background.
+// for T41 (2026-08-25), T42 (2026-08-26), T43 (2026-08-26), and T47
+// (2026-08-26) — each round Brian's own direct feedback after living with
+// the previous one on the physical device. See ECOSYSTEM_PLAN.md's "Burn-in
+// mitigation" section for the original design background.
+//
+// T47 fixed the real remaining gap in T43's overlap fix: T43's collision
+// check only ever compared a fresh position against the *other* element's
+// **current** box, but that element's just-vacated **previous** box is still
+// visibly on screen too, cross-fading out over IDLE_FADE_MS
+// (idleFadeAnimCb) — a transition landing during that window could still
+// clip right onto the fading-out label undetected. Fixed by having each
+// IdleElement remember that previous box (prevPosX/Y/halfW/halfH,
+// fadeOutUntilMs — see its own comment) and checking both boxes, not just
+// the current one, in pickIdlePosition(). Also added light WebSerial
+// debug logging (only fires when a softer constraint actually gets relaxed)
+// so a future overlap report can show whether real crowding, not this
+// now-fixed gap, is the cause.
 //
 // T43 fixed three real (not cosmetic) bugs in T42's simultaneous-date+time
 // design:
@@ -462,6 +475,18 @@ struct IdleElement {
   int16_t posX, posY;
   int16_t halfW, halfH;
   bool hasPosition;
+  // T47: the box this element occupied *before* its most recent transition.
+  // T43's collision check only ever compared against `other`'s *current*
+  // (posX/posY) box — but the outgoing label (idleFadeAnimCb) stays visibly
+  // on screen, fading out over IDLE_FADE_MS, at this *previous* position for
+  // a while after posX/posY above has already moved on to the new spot. A
+  // fresh transition that only avoided the other element's current box could
+  // still land right on top of its still-fading-out old one — the real
+  // remaining gap behind T43's "rare but real" overlap reports. Valid (still
+  // worth checking) only while millis() < fadeOutUntilMs.
+  int16_t prevPosX, prevPosY;
+  int16_t prevHalfW, prevHalfH;
+  uint32_t fadeOutUntilMs;
 };
 IdleElement idleTimeElement;
 IdleElement idleDateElement;
@@ -535,9 +560,19 @@ bool idleBoxesTooClose(int16_t ax, int16_t ay, int16_t aHalfW, int16_t aHalfH,
 // here); avoid-repeat (bug #3) and avoid-the-other-element (bug #2) are
 // best-effort and only dropped if no valid spot can be found while honoring
 // them, so a genuinely crowded case degrades to "may repeat" or "may
-// overlap" rather than "may clip."
+// overlap" rather than "may clip." `debugLabel` ("time"/"date") is only used
+// for the WebSerial lines below, so a future capture of a real overlap
+// report can show whether it came from tier-relaxation (crowding) — see
+// this function's T47 update for the other, now-fixed mechanism.
 void pickIdlePosition(int16_t halfW, int16_t halfH, const IdleElement &self, const IdleElement &other,
-                       int16_t *outX, int16_t *outY) {
+                       const char *debugLabel, int16_t *outX, int16_t *outY) {
+  // T47: `other`'s previous box is still visibly fading out (idleFadeAnimCb)
+  // for a while after other.posX/posY has already moved on — see
+  // IdleElement's own comment on prevPosX/fadeOutUntilMs. Checked as a
+  // second, separate box alongside other's current one whenever it's still
+  // within its fade window.
+  bool otherFadingOut = other.hasPosition && millis() < other.fadeOutUntilMs;
+
   for (int tier = 0; tier < 3; tier++) {
     bool requireRepeatDistance = (tier == 0);
     bool requireGap = (tier <= 1);
@@ -553,6 +588,16 @@ void pickIdlePosition(int16_t halfW, int16_t halfH, const IdleElement &self, con
         if (idleBoxesTooClose(cx, cy, halfW, halfH, other.posX, other.posY, other.halfW, other.halfH,
                                IDLE_MIN_ELEMENT_GAP_PX))
           continue;
+        if (otherFadingOut && idleBoxesTooClose(cx, cy, halfW, halfH, other.prevPosX, other.prevPosY,
+                                                 other.prevHalfW, other.prevHalfH, IDLE_MIN_ELEMENT_GAP_PX))
+          continue;
+      }
+      if (tier > 0) {
+        // T47 debug: only fires when the no-repeat and/or no-overlap
+        // constraint actually had to be dropped to find a fit — confirms
+        // whether real crowding (not just the now-fixed stale-fade-out-box
+        // gap) is a live contributor if overlap reports ever recur.
+        WebSerial.printf("idlePosition: t=%ums element=%s relaxed to tier=%d\n", millis(), debugLabel, tier);
       }
       *outX = cx;
       *outY = cy;
@@ -564,6 +609,7 @@ void pickIdlePosition(int16_t halfW, int16_t halfH, const IdleElement &self, con
   // this only actually triggers if the panel is fully crowded out — an
   // accepted rare degrade (possible repeat/overlap) over an unbounded
   // search.
+  WebSerial.printf("idlePosition: t=%ums element=%s exhausted all tiers, using center fallback\n", millis(), debugLabel);
   *outX = 0;
   *outY = 0;
 }
@@ -591,6 +637,7 @@ void buildIdleScreen(lv_obj_t *scr) {
   idleTimeElement.lastTransitionMs = 0;
   idleTimeElement.dwellMs = (uint32_t)random(IDLE_DWELL_MIN_MS, IDLE_DWELL_MAX_MS + 1);
   idleTimeElement.hasPosition = false;
+  idleTimeElement.fadeOutUntilMs = 0;
 
   idleDateElement.labelA = buildIdleLabel(scr, "", true); // blank (not a fake date) until first real call
   idleDateElement.labelB = buildIdleLabel(scr, "", false);
@@ -598,6 +645,7 @@ void buildIdleScreen(lv_obj_t *scr) {
   idleDateElement.lastTransitionMs = 0;
   idleDateElement.dwellMs = (uint32_t)random(IDLE_DWELL_MIN_MS, IDLE_DWELL_MAX_MS + 1);
   idleDateElement.hasPosition = false;
+  idleDateElement.fadeOutUntilMs = 0;
 }
 
 // Fills *outTm with this device's current local time (UTC + utcOffsetMinutes,
@@ -677,9 +725,21 @@ void updateIdleElement(IdleElement &el, const IdleElement &other, bool isTime) {
   int16_t halfH = (int16_t)(textSize.y / 2) + 2;
 
   int16_t posX, posY;
-  pickIdlePosition(halfW, halfH, el, other, &posX, &posY);
+  pickIdlePosition(halfW, halfH, el, other, isTime ? "time" : "date", &posX, &posY);
   lv_obj_align(incoming, LV_ALIGN_CENTER, posX, posY);
 
+  // T47: stash the box we're vacating *before* overwriting it — its label
+  // (outgoing, above) keeps fading out here for IDLE_FADE_MS, so the other
+  // element still needs to be able to see and avoid it for that long. Only
+  // meaningful if there was a previous real position (hasPosition) — the
+  // very first transition has no old box to protect.
+  if (el.hasPosition) {
+    el.prevPosX = el.posX;
+    el.prevPosY = el.posY;
+    el.prevHalfW = el.halfW;
+    el.prevHalfH = el.halfH;
+    el.fadeOutUntilMs = now + IDLE_FADE_MS;
+  }
   el.posX = posX;
   el.posY = posY;
   el.halfW = halfW;
@@ -2054,6 +2114,24 @@ bool syncGet(const char *host, String &body) {
   return true;
 }
 
+// T48 (2026-08-26): utcOffsetMinutes now free-runs between syncs instead of
+// being re-adopted from every ~1s poll — Brian's request, the same "keep a
+// local-optimistic value, only occasionally reconciled" shape already used
+// for volume/mute/media, just applied to a PC-reported *setting* instead of
+// a user action. Sync (actually reading pcState.utcOffsetMinutes and
+// persisting it) only happens when pcConnected transitions false->true, or
+// otherwise at most once every UTC_OFFSET_RESYNC_INTERVAL_MS — timezone
+// changes are rare, so there's no reason to touch NVS or even look at the
+// field on every poll. Tracked here (not in loop()) so the actual
+// syncPrefs.putInt() write stays on syncPollTask — see syncPrefs's own
+// comment for why that invariant matters (never touched from loop()/the
+// main task). Between syncs, getIdleLocalTime() still free-runs correctly
+// off this device's own NTP-disciplined clock + whichever offset was last
+// accepted; only the *acceptance* of a new offset is gated, not the clock.
+bool syncTaskWasPcConnected = false;
+uint32_t lastUtcOffsetSyncMs = 0;
+constexpr uint32_t UTC_OFFSET_RESYNC_INTERVAL_MS = 3600000; // 1 hour
+
 // One poll: GET the combined settings+PC-state blob, parse it, stage the
 // result for loop() to apply (never touches LVGL or the real globals
 // itself — see this section's top comment). Tries the .lan hostname first,
@@ -2122,17 +2200,29 @@ bool pollSyncState() {
         JsonObject pcState = doc["pcState"];
         result.pcConnected = pcState["pcConnected"] | false;
         result.lastSeenSecondsAgo = pcState["lastSeenSecondsAgo"] | 0;
-        // T44 (2026-08-26): local-time source for the idle screen, confirmed
-        // shape from pc-dash-app via the coordinator — utcOffsetMinutes
-        // (signed minutes east of UTC, e.g. -420 for Phoenix, AZ; see
-        // setupTimeSync()'s comment for why an offset instead of a POSIX TZ
-        // string) is the authoritative value, preserved (not reset to 0)
-        // when absent so a PC-side field not live yet, or a momentary
-        // disconnect, doesn't snap the clock back to plain UTC.
-        // timeZoneName is cosmetic only — see its own top-of-file comment.
-        result.utcOffsetMinutes = pcState["utcOffsetMinutes"] | utcOffsetMinutes;
-        result.timeZoneName = String((const char *)(pcState["timeZoneName"] | ""));
-        if (result.utcOffsetMinutes != utcOffsetMinutes) syncPrefs.putInt("utcOffMin", result.utcOffsetMinutes);
+        // T44/T48 (2026-08-26): local-time source for the idle screen,
+        // confirmed shape from pc-dash-app via the coordinator —
+        // utcOffsetMinutes (signed minutes east of UTC, e.g. -420 for
+        // Phoenix, AZ; see setupTimeSync()'s comment for why an offset
+        // instead of a POSIX TZ string). T48: only actually read/accepted on
+        // a real sync trigger (connect-transition or hourly — see this
+        // function's own top comment); every other poll just carries the
+        // already-applied value straight through unchanged, so loop()'s
+        // unconditional apply below stays a harmless no-op most polls
+        // rather than a fresh network-driven overwrite. timeZoneName is
+        // cosmetic only — see its own top-of-file comment.
+        bool justConnected = !syncTaskWasPcConnected && result.pcConnected;
+        bool resyncDue = (millis() - lastUtcOffsetSyncMs) >= UTC_OFFSET_RESYNC_INTERVAL_MS;
+        if (justConnected || resyncDue) {
+          result.utcOffsetMinutes = pcState["utcOffsetMinutes"] | utcOffsetMinutes;
+          result.timeZoneName = String((const char *)(pcState["timeZoneName"] | ""));
+          if (result.utcOffsetMinutes != utcOffsetMinutes) syncPrefs.putInt("utcOffMin", result.utcOffsetMinutes);
+          lastUtcOffsetSyncMs = millis();
+        }
+        // else: result.utcOffsetMinutes/timeZoneName stay at the neutral
+        // defaults set at the top of this function (current global / "") —
+        // not due for a resync, so this poll doesn't touch either field.
+        syncTaskWasPcConnected = result.pcConnected;
         result.volumePercent = pcState["volumePercent"] | 0;
         result.speakerMuted = pcState["speakerMuted"] | false;
         result.nowPlayingIsPlaying = pcState["nowPlayingIsPlaying"] | false;
@@ -2492,7 +2582,11 @@ void loop() {
       volumeFuseMs = result.volumeFuseMs;
       idleToHomeMs = result.idleToHomeMs;
       dimDelayMs = result.dimDelayMs;
-      utcOffsetMinutes = result.utcOffsetMinutes; // T44 — applied unconditionally, same as the timeouts above
+      // T48: result.utcOffsetMinutes only actually changes on a real sync
+      // trigger (pollSyncState()'s own gate) — most polls it's just the
+      // already-applied value echoed straight through, so this assignment
+      // is a harmless no-op the rest of the time, not a fresh overwrite.
+      utcOffsetMinutes = result.utcOffsetMinutes;
       if (!result.timeZoneName.isEmpty()) timeZoneName = result.timeZoneName; // cosmetic only; don't blank it out on a transient miss
 
       // Volume/mute/now-playing: only trust the payload once the companion
