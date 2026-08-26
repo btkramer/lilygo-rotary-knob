@@ -16,6 +16,8 @@
 #include <HTTPClient.h>
 #include <ArduinoJson.h>
 #include <Preferences.h>
+#include <time.h> // T40: struct tm/strftime for the idle screen's clock
+#include "esp_system.h" // reset-reason diagnostic, see bootResetReason's own comment
 #include "USB.h"
 #include "USBHIDConsumerControl.h"
 #include "secrets.h"
@@ -51,10 +53,26 @@ portMUX_TYPE encoderMux = portMUX_INITIALIZER_UNLOCKED;
 volatile int32_t encoderStepAccum = 0; // net detents since loop() last drained it; ISR writes, loop() reads+clears
 volatile uint32_t lastEncoderIsrMs = 0;
 
+// T40 (2026-08-25): global "was there any real interaction recently" clock,
+// separate from every per-screen *ActivityMs variable below (those each
+// gate their own screen's own return-to-Home/return-to-previous fuse) — this
+// one drives the burn-in-mitigation idle screen (see ECOSYSTEM_PLAN.md's
+// "Burn-in mitigation" section), which can trigger regardless of which
+// screen is currently active. Set from all three real interaction sources:
+// this ISR (rotation), lvTouchpadRead()'s press edge (touch), and the
+// physical-button press branch in loop() (knob click) — "wake = any
+// existing touch/knob interaction" per the design, no new input path needed.
+// A plain volatile, not mutex-guarded, matching lastEncoderIsrMs just above:
+// only ever written with a fresh millis() value from whichever source last
+// fired, so a rare torn/stale read costs at most one loop() iteration's
+// worth of idle-detection lag, not a correctness bug.
+volatile uint32_t lastAnyInteractionMs = 0;
+
 void IRAM_ATTR encoderIsr() {
   uint32_t now = millis();
   if (now - lastEncoderIsrMs < ENCODER_ISR_DEBOUNCE_MS) return;
   lastEncoderIsrMs = now;
+  lastAnyInteractionMs = now;
   bool a = digitalRead(PIN_ENCODER_A) == HIGH;
   bool b = digitalRead(PIN_ENCODER_B) == HIGH;
   portENTER_CRITICAL_ISR(&encoderMux);
@@ -79,6 +97,41 @@ Arduino_CO5300 *panel = new Arduino_CO5300(
     displayBus, SCREEN_RST, 0 /* rotation */, false /* IPS */, SCREEN_WIDTH, SCREEN_HEIGHT);
 
 bool displayOk = false;
+
+// Reset-reason diagnostic (2026-08-25) — added while investigating the
+// recurring "OTA/espota wedged, needs a physical power cycle" pattern
+// (T18/T25/T26, recurred again on T40's own flash attempt). Leading theory:
+// a marginal/shared power supply browning out under OTA's own current spikes
+// (flash writes draw noticeably more current, worsened by this board's
+// PSRAM-in-OPI-mode + always-on display + WiFi all sharing one supply; a
+// reboot's WiFi-reconnect immediately afterward draws its own separate
+// spike) — corroborated by Brian's own observation that another device
+// sharing the same USB hub was also visibly power-starved (charging very
+// slowly). Captured once at boot, read from setup() before anything else
+// runs and printed both immediately (Serial, for a USB-serial-connected
+// session) and on every periodic status line (Serial+WebSerial, since this
+// board normally has no serial access once deployed — see HARDWARE.md's
+// "Debugging without serial access" note). If this ever reads
+// ESP_RST_BROWNOUT right after a future wedge, that's a direct confirmation
+// instead of a theory; consistently reading something else (e.g. ESP_RST_SW,
+// meaning a normal ESP.restart()) would argue against this theory instead.
+esp_reset_reason_t bootResetReason;
+
+const char *resetReasonStr(esp_reset_reason_t reason) {
+  switch (reason) {
+    case ESP_RST_POWERON:   return "POWERON";
+    case ESP_RST_EXT:       return "EXT_PIN";
+    case ESP_RST_SW:        return "SW (ESP.restart())";
+    case ESP_RST_PANIC:     return "PANIC";
+    case ESP_RST_INT_WDT:   return "INT_WDT";
+    case ESP_RST_TASK_WDT:  return "TASK_WDT";
+    case ESP_RST_WDT:       return "OTHER_WDT";
+    case ESP_RST_DEEPSLEEP: return "DEEPSLEEP_WAKE";
+    case ESP_RST_BROWNOUT:  return "BROWNOUT";
+    case ESP_RST_SDIO:      return "SDIO";
+    default:                return "UNKNOWN";
+  }
+}
 
 // Touch bring-up only at this stage — same "prove it works before building
 // on it" approach as the encoder and display. LilyGo's README says this
@@ -210,7 +263,10 @@ void lvTouchpadRead(lv_indev_t *indev, lv_indev_data_t *data) {
   static lv_indev_state_t lastLoggedTouchState = LV_INDEV_STATE_RELEASED;
   if (newState != lastLoggedTouchState) {
     lastLoggedTouchState = newState;
-    if (newState == LV_INDEV_STATE_PRESSED) touchPressCounter++; // T30 fix, see its own comment above
+    if (newState == LV_INDEV_STATE_PRESSED) {
+      touchPressCounter++; // T30 fix, see its own comment above
+      lastAnyInteractionMs = millis(); // T40: any touch counts as "not idle" — see lastAnyInteractionMs's own comment
+    }
     Serial.printf("touchEdge: t=%ums %s\n", millis(), newState == LV_INDEV_STATE_PRESSED ? "PRESSED" : "RELEASED");
     WebSerial.printf("touchEdge: t=%ums %s\n", millis(), newState == LV_INDEV_STATE_PRESSED ? "PRESSED" : "RELEASED");
   }
@@ -320,6 +376,150 @@ void buildHomeScreen(lv_obj_t *scr) {
   lv_obj_add_flag(homeOfflineLabel, LV_OBJ_FLAG_HIDDEN); // shown by updateHomeScreen() once pcConnected is known
 
   updateHomeScreen();
+}
+
+// Burn-in-mitigation idle screen (T40, 2026-08-25; visual treatment redone
+// for T41, same day, after Brian saw T40 live). See ECOSYSTEM_PLAN.md's
+// "Burn-in mitigation" section for the original design background.
+//
+// T41 changes, each Brian's own explicit feedback after watching T40 run:
+// - **Dropped the separate pixel-shift mechanism entirely** — redundant once
+//   content/font/position all already vary every cycle (below); shifting a
+//   handful of px on top of that was no longer doing distinct work.
+// - **Brightness raised to DISPLAY_BRIGHTNESS_IDLE** (~75% of full range,
+//   see that constant's own comment) — T40's original level read as too dim
+//   to actually be useful as an ambient glance.
+// - **Cross-fade between states** (idleFadeAnimCb below) instead of a hard
+//   text swap, and a slower overall cycle — see IDLE_DWELL_MS/IDLE_FADE_MS.
+// - **Font and position both vary every cycle**, drawn from small pools
+//   below, not just alternating between two fixed states — the actual
+//   burn-in-relevant goal Brian named directly: no small group of pixels
+//   should hold the same on/off state indefinitely. Doesn't need to be an
+//   exhaustive combination matrix, just varied enough.
+//
+// Still deliberately just a clock with no continuous animation (a live-
+// ticking seconds display would mean a full-panel redraw every second
+// indefinitely while idle — exactly what HARDWARE.md's "full-frame redraws
+// only" rule warns against); the cross-fade itself is a brief, occasional
+// opacity animation on a plain label (proven safe on this hardware already —
+// see speakerMutePulseAnimCb/nowPlayingGlowAnimCb, same technique), not a
+// live lv_arc, so it doesn't run into that rule's actual hazard.
+lv_obj_t *idleScreen;
+// Two labels, cross-faded between — see updateIdleScreen()'s own comment for
+// why a single label can't cross-dissolve between two different text
+// strings on its own.
+lv_obj_t *idleLabelA;
+lv_obj_t *idleLabelB;
+
+// Font pool: every Montserrat size already enabled in lv_conf.h for other
+// screens (see each one's own bundled-font comment there) — no new font
+// assets needed. Deliberately not trying to add real bold/regular *weight*
+// variants (LVGL's bundled fonts are one weight per size) — varying size
+// already changes each glyph's actual lit pixels meaningfully, which is the
+// part that matters here.
+constexpr const lv_font_t *IDLE_FONT_POOL[] = {
+    &lv_font_montserrat_22, &lv_font_montserrat_24, &lv_font_montserrat_28,
+    &lv_font_montserrat_42, &lv_font_montserrat_48};
+constexpr size_t IDLE_FONT_POOL_COUNT = sizeof(IDLE_FONT_POOL) / sizeof(IDLE_FONT_POOL[0]);
+// Wider spread than T40's original ±4px pixel-shift — that amplitude was
+// deliberately tiny because it was the *only* thing varying and a bigger
+// jump would've looked like a glitch; now that font/content already change
+// visibly every cycle, a more noticeable reshuffle reads as intentional
+// instead. Kept within a safe margin of this round display's usable center
+// area for the largest pooled font (48pt) with the longest expected string
+// ("Wed Aug 26" / "12:00 PM").
+constexpr int8_t IDLE_POSITION_POOL[][2] = {
+    {0, 0}, {24, -18}, {-22, 14}, {18, 20}, {-24, -14},
+    {14, -22}, {-16, 18}, {20, 8}, {-20, -20}, {8, 22}};
+constexpr size_t IDLE_POSITION_POOL_COUNT = sizeof(IDLE_POSITION_POOL) / sizeof(IDLE_POSITION_POOL[0]);
+constexpr uint32_t IDLE_DWELL_MS = 12000; // time between the start of one transition and the next — "10-15s" per Brian
+constexpr uint32_t IDLE_FADE_MS = 1500;   // cross-fade duration — "~1-2s" per Brian
+
+void idleFadeAnimCb(void *obj, int32_t value) {
+  lv_obj_set_style_text_opa((lv_obj_t *)obj, (lv_opa_t)value, 0);
+}
+
+void buildIdleScreen(lv_obj_t *scr) {
+  lv_obj_set_style_bg_color(scr, lv_color_black(), 0);
+  lv_obj_set_style_bg_opa(scr, LV_OPA_COVER, 0);
+  lv_obj_remove_flag(scr, LV_OBJ_FLAG_SCROLLABLE);
+
+  // Mid-grey, not full white, on both labels — a slightly muted text color
+  // reads more deliberately "ambient" than stark white against pure black.
+  idleLabelA = lv_label_create(scr);
+  lv_obj_set_style_text_font(idleLabelA, IDLE_FONT_POOL[0], 0);
+  lv_obj_set_style_text_color(idleLabelA, lv_color_hex(0x808080), 0);
+  lv_obj_center(idleLabelA);
+  lv_label_set_text(idleLabelA, "--:--"); // placeholder until updateIdleScreen()'s first real call
+
+  idleLabelB = lv_label_create(scr);
+  lv_obj_set_style_text_font(idleLabelB, IDLE_FONT_POOL[0], 0);
+  lv_obj_set_style_text_color(idleLabelB, lv_color_hex(0x808080), 0);
+  lv_obj_center(idleLabelB);
+  lv_label_set_text(idleLabelB, "");
+  lv_obj_set_style_text_opa(idleLabelB, LV_OPA_TRANSP, 0); // hidden until the first cross-fade brings it in
+}
+
+// Called once right before this screen is shown, and every loop() pass while
+// it stays shown — cheap to call unconditionally, since it only actually
+// does anything once per IDLE_DWELL_MS, not every call. A single lv_label
+// can't cross-dissolve between two different text strings on its own (no
+// per-glyph interpolation), so this keeps two overlapping labels and
+// alternates which one is "incoming" (fading 0->COVER at a freshly-picked
+// font/position) vs. "outgoing" (fading COVER->0 wherever it already was).
+void updateIdleScreen() {
+  static uint32_t lastTransitionMs = 0;
+  static bool showingTime = true; // which *content* is about to become visible
+  static bool aIsVisible = true;  // which *label* is currently the visible one
+
+  uint32_t now = millis();
+  if (lastTransitionMs == 0) {
+    lastTransitionMs = now; // first call ever — just start the dwell clock, nothing to animate yet
+    return;
+  }
+  if (now - lastTransitionMs < IDLE_DWELL_MS) return;
+  lastTransitionMs = now;
+  showingTime = !showingTime;
+
+  lv_obj_t *outgoing = aIsVisible ? idleLabelA : idleLabelB;
+  lv_obj_t *incoming = aIsVisible ? idleLabelB : idleLabelA;
+  aIsVisible = !aIsVisible;
+
+  struct tm timeinfo;
+  char buf[24];
+  // getLocalTime(..., 0): a single non-blocking check, never waits — loop()
+  // must never block (see the "Docker app sync protocol" section's top
+  // comment for why). Returns false until SNTP has actually synced at least
+  // once (see setupTimeSync()), e.g. briefly after boot before WiFi finishes
+  // connecting.
+  if (getLocalTime(&timeinfo, 0)) {
+    // Standard (non-GNU) strftime specifiers only — the toolchain's libc
+    // here is a trimmed embedded newlib, not glibc, so the "%-I"/"%-d"
+    // no-leading-zero GNU extensions aren't something to rely on.
+    strftime(buf, sizeof(buf), showingTime ? "%I:%M %p" : "%a %b %d", &timeinfo);
+  } else {
+    strcpy(buf, "--:--");
+  }
+  lv_label_set_text(incoming, buf);
+  lv_obj_set_style_text_font(incoming, IDLE_FONT_POOL[random(IDLE_FONT_POOL_COUNT)], 0);
+  const int8_t *pos = IDLE_POSITION_POOL[random(IDLE_POSITION_POOL_COUNT)];
+  lv_obj_align(incoming, LV_ALIGN_CENTER, pos[0], pos[1]);
+
+  lv_anim_t fadeOut;
+  lv_anim_init(&fadeOut);
+  lv_anim_set_var(&fadeOut, outgoing);
+  lv_anim_set_exec_cb(&fadeOut, idleFadeAnimCb);
+  lv_anim_set_values(&fadeOut, LV_OPA_COVER, LV_OPA_TRANSP);
+  lv_anim_set_time(&fadeOut, IDLE_FADE_MS);
+  lv_anim_start(&fadeOut);
+
+  lv_anim_t fadeIn;
+  lv_anim_init(&fadeIn);
+  lv_anim_set_var(&fadeIn, incoming);
+  lv_anim_set_exec_cb(&fadeIn, idleFadeAnimCb);
+  lv_anim_set_values(&fadeIn, LV_OPA_TRANSP, LV_OPA_COVER);
+  lv_anim_set_time(&fadeIn, IDLE_FADE_MS);
+  lv_anim_start(&fadeIn);
 }
 
 // Volume screen: the only screen reachable by rotating the knob, from any
@@ -558,8 +758,14 @@ void showVolumeOverlay(int delta) {
     // anyway, not a real destination (see volumeReturnScreen's own comment).
     // While actively muted, Mute stays the legitimate target so its
     // indicator survives a volume bump instead of getting bounced behind it.
-    volumeReturnScreen =
-        (active == speakerMuteScreen && !speakerMuted) ? speakerMuteReturnScreen : active;
+    // T40: idleScreen is never a real destination either (same reasoning as
+    // Volume itself never being one) — rotating the knob is itself a real
+    // interaction, so lastAnyInteractionMs already resets and the idle
+    // screen would just get swapped back to Home again next loop() pass
+    // regardless; redirecting the return target here avoids a one-frame
+    // bounce through it first.
+    volumeReturnScreen = (active == idleScreen) ? homeScreen
+        : (active == speakerMuteScreen && !speakerMuted) ? speakerMuteReturnScreen : active;
     lv_screen_load(volumeScreen);
   }
   volumePercent = constrain(volumePercent + delta, 0, 100);
@@ -717,7 +923,10 @@ void showSpeakerMuteOverlay() {
     // Volume is always purely transient (see volumeReturnScreen's own
     // comment) — never a real destination, so skip straight past it
     // unconditionally rather than chaining through it on the way back.
-    speakerMuteReturnScreen = (active == volumeScreen) ? volumeReturnScreen : active;
+    // T40: idleScreen isn't a real destination either — see
+    // showVolumeOverlay()'s matching comment.
+    speakerMuteReturnScreen = (active == idleScreen) ? homeScreen
+        : (active == volumeScreen) ? volumeReturnScreen : active;
     lv_screen_load(speakerMuteScreen);
   }
   speakerMuted = !speakerMuted;
@@ -747,6 +956,24 @@ constexpr uint32_t NOW_PLAYING_ACCENT_COLOR = 0x4FB477; // same green as the moc
 // Operator-adjustable from the Docker app, same as volumeFuseMs above.
 constexpr uint32_t IDLE_TO_HOME_MS_DEFAULT = 30000; // standard non-Home idle timeout, see PROGRESS.md
 uint32_t idleToHomeMs = IDLE_TO_HOME_MS_DEFAULT;
+// T40 (2026-08-25): how long since the last real interaction (any screen,
+// including Home) before the burn-in-mitigation idle screen takes over — see
+// ECOSYSTEM_PLAN.md's "Burn-in mitigation" section and loop()'s idle-state
+// machine below. Operator-adjustable from pc-dash-app, same top-level-under-
+// "timeouts" schema shape as volumeFuseMs/idleToHomeMs above (per the T31
+// lesson about that shape) — field name/default proposed to the coordinator
+// for pc-dash-hub to match, not yet confirmed live end-to-end.
+constexpr uint32_t DIM_DELAY_MS_DEFAULT = 60000;
+uint32_t dimDelayMs = DIM_DELAY_MS_DEFAULT;
+// Tracks "is the panel currently dimmed" independently of which screen ends
+// up active — see loop()'s idle-state machine for why this can't just be
+// `lv_screen_active() == idleScreen`: a rotation/button press while dimmed
+// jumps straight to Volume/Speaker Mute (showVolumeOverlay()/
+// showSpeakerMuteOverlay(), earlier in the same loop() pass) *before* the
+// idle-state check ever runs, so by the time it does, the active screen is
+// already something other than idleScreen even though brightness still
+// needs restoring.
+bool displayDimmed = false;
 // T34 (2026-08-22): Now Playing's own idle-to-Home fuse specifically, used
 // only while nowPlayingIsPlaying is false (paused/stopped) — see loop()'s
 // own comment on this. Not operator-adjustable like idleToHomeMs/volumeFuseMs
@@ -1359,6 +1586,29 @@ void screenCycleGestureCb(lv_event_t *e) {
   }
 }
 
+// T40/T41 (2026-08-25): three brightness levels for three different purposes
+// — deliberately not the same constant reused, since "dim for burn-in
+// ambient legibility" and "dim to cut power draw during a flash write" want
+// very different values. DISPLAY_BRIGHTNESS_NORMAL matches this board's
+// original, already-tuned boot-time value (unchanged).
+// DISPLAY_BRIGHTNESS_IDLE is the idle-state machine's (loop()) ambient
+// level — T40 originally used a very low value here (reusing what's now
+// DISPLAY_BRIGHTNESS_OTA_DIM) that Brian found unreadably dim in practice;
+// T41 bumped it to roughly 75% of the full 0-255 range instead, close to
+// DISPLAY_BRIGHTNESS_NORMAL on purpose — the idle screen's own alternating
+// content/font/position already does the actual burn-in-relevant work (see
+// idleScreen's own top comment), so this level exists for a softer "resting"
+// look, not to meaningfully cut power draw.
+// DISPLAY_BRIGHTNESS_OTA_DIM keeps the original very-low value — used only
+// during an active OTA write (see setupHttpOta()/setupOTA()'s onStart/onEnd/
+// onError), where cutting power draw is the actual point and nobody's
+// expected to be reading the screen anyway.
+// None of these are operator-adjustable (no request for that yet, unlike
+// dimDelayMs) — plain constants until there's a reason to change that.
+constexpr uint8_t DISPLAY_BRIGHTNESS_NORMAL = 200;
+constexpr uint8_t DISPLAY_BRIGHTNESS_IDLE = 191; // ~75% of 0-255
+constexpr uint8_t DISPLAY_BRIGHTNESS_OTA_DIM = 20;
+
 void setupDisplay() {
   pinMode(SCREEN_EN, OUTPUT);
   digitalWrite(SCREEN_EN, HIGH);
@@ -1370,7 +1620,7 @@ void setupDisplay() {
   }
   Serial.println("Display init OK");
 
-  panel->setBrightness(200);
+  panel->setBrightness(DISPLAY_BRIGHTNESS_NORMAL);
   panel->fillScreen(BLACK); // clear before LVGL takes over, avoid boot-time garbage
 }
 
@@ -1426,6 +1676,12 @@ void setupLVGL() {
   buildNowPlayingScreen(nowPlayingScreen);
   quickJumpScreen = lv_obj_create(NULL);
   buildQuickJumpScreen(quickJumpScreen);
+  idleScreen = lv_obj_create(NULL);
+  buildIdleScreen(idleScreen);
+  // No gesture subscriptions/makeGestureBubbleThrough on idleScreen, deliberately
+  // — a touch here should just wake the device (any touch already updates
+  // lastAnyInteractionMs via lvTouchpadRead()), not trigger a specific
+  // nested action like Quick-jump or the Home<->Now-Playing swipe would.
 
   // Swipe-up entry point for the quick-jump grid. Subscribed on the indev
   // itself, not a screen object — see quickJumpGestureCb's comment for why
@@ -1571,6 +1827,7 @@ struct SyncResult {
   uint32_t lastSeenSecondsAgo;
   uint32_t volumeFuseMs;
   uint32_t idleToHomeMs;
+  uint32_t dimDelayMs; // T40, see its own top-of-file comment
   // pcState's volume/mute/now-playing fields (T14, 2026-08-21) — parsed
   // unconditionally below, but loop() only ever applies them when
   // result.pcConnected is true (see loop()'s sync-apply step and
@@ -1619,6 +1876,7 @@ bool pollSyncState() {
   SyncResult result;
   result.volumeFuseMs = volumeFuseMs; // preserved unless the payload has a real value
   result.idleToHomeMs = idleToHomeMs;
+  result.dimDelayMs = dimDelayMs;
   result.pcConnected = false;
   result.lastSeenSecondsAgo = 0;
   // Left at these neutral defaults (not read from the local globals — those
@@ -1653,8 +1911,14 @@ bool pollSyncState() {
           // actually exists, rather than storing fields nothing uses.
           result.volumeFuseMs = timeouts["volumeFuseMs"] | volumeFuseMs;
           result.idleToHomeMs = timeouts["idleToHomeMs"] | idleToHomeMs;
+          // T40: field name/default ("dimDelayMs", 60000ms) proposed to the
+          // coordinator for pc-dash-hub to match — not yet confirmed live
+          // end-to-end, so this falls back to the local default/NVS value
+          // (same `| dimDelayMs` shape as the other two) until it does.
+          result.dimDelayMs = timeouts["dimDelayMs"] | dimDelayMs;
           if (result.volumeFuseMs != volumeFuseMs) syncPrefs.putUInt("volFuseMs", result.volumeFuseMs);
           if (result.idleToHomeMs != idleToHomeMs) syncPrefs.putUInt("idleMs", result.idleToHomeMs);
+          if (result.dimDelayMs != dimDelayMs) syncPrefs.putUInt("dimDelayMs", result.dimDelayMs);
         }
         // pc-dash-app (step 4) is live now (2026-08-20) — pcState carries
         // real volume/mute/now-playing values, reconciled against the local
@@ -1719,7 +1983,9 @@ void setupSyncSettings() {
   syncPrefs.begin("sync", false);
   volumeFuseMs = syncPrefs.getUInt("volFuseMs", VOLUME_FUSE_MS_DEFAULT);
   idleToHomeMs = syncPrefs.getUInt("idleMs", IDLE_TO_HOME_MS_DEFAULT);
-  Serial.printf("sync: loaded from NVS: volumeFuseMs=%u idleToHomeMs=%u\n", volumeFuseMs, idleToHomeMs);
+  dimDelayMs = syncPrefs.getUInt("dimDelayMs", DIM_DELAY_MS_DEFAULT);
+  Serial.printf("sync: loaded from NVS: volumeFuseMs=%u idleToHomeMs=%u dimDelayMs=%u\n",
+                volumeFuseMs, idleToHomeMs, dimDelayMs);
 
   syncResultMutex = xSemaphoreCreateMutex();
   xTaskCreatePinnedToCore(syncPollTask, "syncPoll", 8192, NULL, 1, NULL, 0);
@@ -1748,11 +2014,38 @@ void setupOTA() {
 
   ArduinoOTA.setHostname("t-encoder-pro");
   ArduinoOTA.setPassword(OTA_PASSWORD);
-  ArduinoOTA.onStart([]() { Serial.println("OTA: start"); });
-  ArduinoOTA.onEnd([]() { Serial.println("OTA: done"); });
-  ArduinoOTA.onError([](ota_error_t error) { Serial.printf("OTA error: %u\n", error); });
+  // Dim for the duration of the write, same reasoning/mitigation as
+  // setupHttpOta()'s upload handler (see bootResetReason's own comment) —
+  // this is the other of the two OTA paths, equally exposed to the same
+  // flash-write current spike.
+  ArduinoOTA.onStart([]() {
+    Serial.println("OTA: start");
+    panel->setBrightness(DISPLAY_BRIGHTNESS_OTA_DIM);
+  });
+  ArduinoOTA.onEnd([]() {
+    Serial.println("OTA: done");
+    panel->setBrightness(displayDimmed ? DISPLAY_BRIGHTNESS_IDLE : DISPLAY_BRIGHTNESS_NORMAL);
+  });
+  ArduinoOTA.onError([](ota_error_t error) {
+    Serial.printf("OTA error: %u\n", error);
+    panel->setBrightness(displayDimmed ? DISPLAY_BRIGHTNESS_IDLE : DISPLAY_BRIGHTNESS_NORMAL);
+  });
   ArduinoOTA.begin();
   Serial.println("OTA ready");
+}
+
+// T40 (2026-08-25): NTP time sync for the idle screen's clock — nothing on
+// this board read/needed wall-clock time before this. configTzTime() sets
+// both the TZ env var (secrets.h's TIMEZONE_POSIX, a POSIX TZ string so DST
+// is handled automatically) and starts SNTP in one call; it doesn't block —
+// getLocalTime() (see updateIdleScreen()) just returns false until the first
+// sync actually lands. Only called once WiFi is up (same "no WiFi, no X"
+// degradation as OTA/WebSerial above) — the idle screen shows a placeholder
+// until then.
+void setupTimeSync() {
+  if (WiFi.status() != WL_CONNECTED) return;
+  configTzTime(TIMEZONE_POSIX, "pool.ntp.org", "time.nist.gov");
+  Serial.println("Time sync started (SNTP)");
 }
 
 // Debug console over WiFi (http://<device-ip>/webserial) — added 2026-08-07
@@ -1816,6 +2109,13 @@ void setupHttpOta() {
         }
         bool ok = httpOtaUploadOk && !Update.hasError();
         request->send(ok ? 200 : 500, "text/plain", ok ? "OK" : "FAIL");
+        // Restore whatever brightness applied before this upload dimmed it
+        // (see the upload handler's own comment on why it dims) — respects
+        // displayDimmed rather than assuming NORMAL, so this doesn't fight
+        // the T40 idle-state machine if an upload happened to start while
+        // already idle. Harmless in the success case too (board reboots
+        // moments later anyway, resetting brightness fresh at boot).
+        panel->setBrightness(displayDimmed ? DISPLAY_BRIGHTNESS_IDLE : DISPLAY_BRIGHTNESS_NORMAL);
         if (ok) {
           // Reboot from loop() after a short grace period, not inline here
           // — give the AsyncTCP task time to actually flush this response
@@ -1831,6 +2131,18 @@ void setupHttpOta() {
             Serial.println("HTTP OTA: rejected, bad auth");
             return; // main handler above still runs and sends 401 once the (now-ignored) body finishes arriving
           }
+          // 2026-08-25: dim for the duration of the write. Originally added
+          // to mitigate a suspected power-brownout theory for this project's
+          // recurring OTA wedge — that theory didn't hold up (a proper
+          // dedicated 2A supply didn't fix it; the actual cause turned out to
+          // be per-attempt device-side state, not power — see
+          // bootResetReason's own comment and PROGRESS.md's T40 entry for the
+          // full story). Left in regardless: flash writes still genuinely
+          // draw more current than normal operation, so cutting the
+          // display's own draw during that window is harmless and still a
+          // reasonable margin to keep, even though it wasn't the fix this
+          // particular wedge needed.
+          panel->setBrightness(DISPLAY_BRIGHTNESS_OTA_DIM);
           Serial.printf("HTTP OTA: start, filename=%s\n", filename.c_str());
           httpOtaUploadOk = Update.begin(UPDATE_SIZE_UNKNOWN);
           if (!httpOtaUploadOk) Update.printError(Serial);
@@ -1883,6 +2195,10 @@ void setupHttpOta() {
 
 void setup() {
   Serial.begin(115200);
+  // First thing, before anything else has a chance to run — see
+  // bootResetReason's own comment for why this exists.
+  bootResetReason = esp_reset_reason();
+  Serial.printf("Boot reset reason: %s\n", resetReasonStr(bootResetReason));
   setupSyncSettings(); // NVS load, no WiFi needed — operator-adjusted timeouts apply even if this boot never reaches pc-dash-hub
   pinMode(PIN_ENCODER_A, INPUT_PULLUP);
   pinMode(PIN_ENCODER_B, INPUT_PULLUP);
@@ -1896,6 +2212,7 @@ void setup() {
   setupTouch();
   setupLVGL();
   setupOTA();
+  setupTimeSync(); // T40 — needs WiFi, same as WebSerial/HTTP OTA below
   setupWebSerial();
   setupHttpOta();
 
@@ -1937,6 +2254,7 @@ void loop() {
       lastSeenSecondsAgo = result.lastSeenSecondsAgo;
       volumeFuseMs = result.volumeFuseMs;
       idleToHomeMs = result.idleToHomeMs;
+      dimDelayMs = result.dimDelayMs;
 
       // Volume/mute/now-playing: only trust the payload once the companion
       // app has actually reported in on *this* poll (result.pcConnected) —
@@ -2123,22 +2441,41 @@ void loop() {
     // the hub," syncOk=yes+pcConnected=no means "reached it fine, it just
     // doesn't have a PC yet" — collapsing these into one field would make
     // the two indistinguishable from this log alone.
-    Serial.printf("status: wifi=%s display=%s touch=%s ip=%s syncOk=%s pcConnected=%s lastSeen=%us\n",
+    // bootResetReason: see its own top-of-file comment — repeated on every
+    // status line (not just once at boot) since this board normally has no
+    // serial access once deployed; a WebSerial viewer connecting well after
+    // boot still needs to see how this boot actually started.
+    // freeHeap (2026-08-25): added while reopening the OTA-wedge
+    // investigation — Brian pointed out he's seen failures shortly after a
+    // restart too, which undercuts "just needs a clean boot" as the *whole*
+    // explanation (a fresh-restart-immediately-before-flashing did fix T40's
+    // own wedge this session — see PROGRESS.md — but that doesn't rule out
+    // some slower-building resource pressure, e.g. heap fragmentation,
+    // separately affecting things over longer uptime). This alone doesn't
+    // diagnose anything by itself; it just starts accumulating real
+    // heap-over-time data on every boot going forward, so a future
+    // WebSerial capture can actually show whether free heap trends downward
+    // over hours/days of normal operation rather than staying flat.
+    Serial.printf("status: wifi=%s display=%s touch=%s ip=%s syncOk=%s pcConnected=%s lastSeen=%us resetReason=%s freeHeap=%u\n",
                    WiFi.status() == WL_CONNECTED ? "up" : "down",
                    displayOk ? "ok" : "FAIL",
                    touchOk ? "ok" : "FAIL",
                    WiFi.status() == WL_CONNECTED ? WiFi.localIP().toString().c_str() : "-",
                    lastSyncPollOk ? "yes" : "no",
                    pcConnected ? "yes" : "no",
-                   lastSeenSecondsAgo);
-    WebSerial.printf("status: wifi=%s display=%s touch=%s ip=%s syncOk=%s pcConnected=%s lastSeen=%us\n",
+                   lastSeenSecondsAgo,
+                   resetReasonStr(bootResetReason),
+                   (unsigned)ESP.getFreeHeap());
+    WebSerial.printf("status: wifi=%s display=%s touch=%s ip=%s syncOk=%s pcConnected=%s lastSeen=%us resetReason=%s freeHeap=%u\n",
                       WiFi.status() == WL_CONNECTED ? "up" : "down",
                       displayOk ? "ok" : "FAIL",
                       touchOk ? "ok" : "FAIL",
                       WiFi.status() == WL_CONNECTED ? WiFi.localIP().toString().c_str() : "-",
                       lastSyncPollOk ? "yes" : "no",
                       pcConnected ? "yes" : "no",
-                      lastSeenSecondsAgo);
+                      lastSeenSecondsAgo,
+                      resetReasonStr(bootResetReason),
+                      (unsigned)ESP.getFreeHeap());
   }
 
   // Drain whatever encoderIsr() has accumulated since the last iteration —
@@ -2233,10 +2570,49 @@ void loop() {
     uint32_t now = millis();
     if (key == LOW && (now - lastKeyMs) > DEBOUNCE_MS) {
       lastKeyMs = now;
+      lastAnyInteractionMs = now; // T40: knob press counts as "not idle" — see lastAnyInteractionMs's own comment
       showSpeakerMuteOverlay(); // sends the HID mute pulse itself
       Serial.println("MUTE");
       WebSerial.println("MUTE");
     }
+  }
+
+  // T40 (2026-08-25): burn-in-mitigation idle screen — see
+  // ECOSYSTEM_PLAN.md's "Burn-in mitigation" section and lastAnyInteractionMs's
+  // own top-of-file comment. Deliberately global (checked regardless of which
+  // screen is actually active, not gated to only fire from Home) rather than
+  // "wait until every other fuse above has already settled on Home first" —
+  // dimDelayMs is expected to always be configured longer than every other
+  // timeout above, so in practice this only ever fires once everything else
+  // has already returned to Home anyway; being unconditional here just means
+  // it can't get stuck waiting on some future screen that doesn't have its
+  // own idle-to-Home fuse yet, the same gap T35 found in an earlier screen.
+  //
+  // Driven by displayDimmed (see its own comment), not lv_screen_active() —
+  // a rotation or button press that arrives while dimmed is drained by the
+  // encoder/key-edge blocks *above* this one in the same loop() pass, and
+  // showVolumeOverlay()/showSpeakerMuteOverlay() already jump straight to
+  // Volume/Speaker Mute in that case (see their own idleScreen handling), so
+  // by the time this runs, lv_screen_active() may already be neither
+  // idleScreen nor Home — brightness still needs restoring regardless of
+  // which screen that interaction actually landed on.
+  bool shouldBeIdle = (millis() - lastAnyInteractionMs) > dimDelayMs;
+  if (shouldBeIdle && !displayDimmed) {
+    displayDimmed = true;
+    panel->setBrightness(DISPLAY_BRIGHTNESS_IDLE);
+    updateIdleScreen(); // set real content before it's ever shown, not a blank/placeholder first frame
+    lv_screen_load(idleScreen);
+  } else if (!shouldBeIdle && displayDimmed) {
+    displayDimmed = false;
+    panel->setBrightness(DISPLAY_BRIGHTNESS_NORMAL);
+    // Only force Home if idleScreen is still what's actually showing (the
+    // touch-wake path — idleScreen has no gesture/click handlers to redirect
+    // it anywhere else). A rotation/button-press wake already loaded
+    // Volume/Speaker Mute directly above; don't stomp that with a redundant
+    // Home load.
+    if (lv_screen_active() == idleScreen) lv_screen_load(homeScreen);
+  } else if (shouldBeIdle && displayDimmed && lv_screen_active() == idleScreen) {
+    updateIdleScreen(); // keep alternating time/date and pixel-shifting while it stays shown
   }
 
   delay(5); // matches Arduino_GFX's own LVGL example's loop cadence
