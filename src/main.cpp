@@ -379,29 +379,38 @@ void buildHomeScreen(lv_obj_t *scr) {
 }
 
 // Burn-in-mitigation idle screen (T40, 2026-08-25). Visual treatment redone
-// for T41 (2026-08-25) after Brian saw T40 live, then again for T42
-// (2026-08-26) after Brian saw T41 live. See ECOSYSTEM_PLAN.md's "Burn-in
-// mitigation" section for the original design background.
+// for T41 (2026-08-25), T42 (2026-08-26), and T43 (2026-08-26) — each round
+// Brian's own direct feedback after living with the previous one on the
+// physical device. See ECOSYSTEM_PLAN.md's "Burn-in mitigation" section for
+// the original design background.
 //
-// T42 changes, each Brian's own explicit feedback after watching T41 run:
-// - **Date and time shown simultaneously, not alternating** — each is its
-//   own independent element with its own independently-random position, not
-//   paired/mirrored to the same spot or treated as one unit.
-// - **Independent fade cycles per element** — date and time each fade out
-//   and back in on their own schedule, landing at a freshly-picked random
-//   position/font every time, deliberately drifting out of phase with each
-//   other rather than sharing one synchronized cadence (see
-//   IDLE_DWELL_MIN_MS/IDLE_DWELL_MAX_MS below).
-// - **Dropped the two smallest font sizes** (22/24) from the pool — too
-//   small to read comfortably at a glance, more so now that two elements
-//   share the screen instead of one owning the whole display.
-// - **Position pool widened** well beyond T41's tight central cluster,
-//   toward the panel's actual usable edges — both a more dynamic look and,
-//   per Brian, the actual burn-in-relevant point: spread wear across more of
-//   the physical pixels instead of reusing the same central handful
-//   repeatedly.
+// T43 fixed three real (not cosmetic) bugs in T42's simultaneous-date+time
+// design:
+// 1. **Text sometimes clipped off-screen.** T42's IDLE_POSITION_POOL was a
+//    fixed set of offsets hand-tuned by eyeballing one font/string combo,
+//    never checked against the *actual* rendered box of whatever font/string
+//    a given cycle happened to pick, and never checked against the panel's
+//    true round shape — a position inside the square LVGL coordinate frame
+//    can still clip against the physical circular bezel.
+// 2. **Date and time landed exactly on top of each other** — the
+//    no-collision-check gap T42's writeup flagged as a theoretical
+//    possibility, confirmed to actually happen in real use.
+// 3. **An element faded back in at the same spot it just left** —
+//    independent per-cycle random selection doesn't exclude the
+//    immediately-previous pick.
 //
-// T41's carryovers, unchanged: brightness (DISPLAY_BRIGHTNESS_IDLE), no
+// Fix: replaced the fixed pool with real per-cycle rejection sampling
+// (pickIdlePosition() below) against the box LVGL actually measures for
+// whatever font/string this cycle picked (lv_text_get_size()) — checked
+// against the panel's real circular boundary (idleBoxFitsCircle(), all 4
+// box corners, not just the center point), against this element's own
+// immediately-previous position, and against the other element's current
+// position (idleBoxesTooClose()). See IdleElement/pickIdlePosition's own
+// comments for exactly how.
+//
+// T42 carryovers, unchanged: date and time both shown at once, each its own
+// independent element/timing (IDLE_DWELL_MIN_MS/MAX_MS), dropped 22/24pt
+// fonts. T41 carryovers, unchanged: brightness (DISPLAY_BRIGHTNESS_IDLE), no
 // separate pixel-shift mechanism (redundant once content/font/position all
 // vary independently), cross-fade via idleFadeAnimCb (plain opacity anim on
 // a label, same proven-safe technique as speakerMutePulseAnimCb/
@@ -416,15 +425,23 @@ lv_obj_t *idleScreen;
 // strings on its own (no per-glyph interpolation), so each element keeps two
 // overlapping labels and alternates which one is "incoming" (fading in at a
 // freshly-picked font/position) vs. "outgoing" (fading out wherever it
-// already was). T41 had only one such pair, alternating between showing time
-// and date content; T42 needs both visible at once, so each now gets its own
-// pair plus its own independent timing state.
+// already was).
 struct IdleElement {
   lv_obj_t *labelA;
   lv_obj_t *labelB;
   bool aIsVisible;
   uint32_t lastTransitionMs;
   uint32_t dwellMs; // this element's current wait — re-rolled every transition, see IDLE_DWELL_MIN_MS/MAX_MS
+  // T43: the position + measured half-extents of whichever label is
+  // actually visible right now. The *other* element reads these to avoid
+  // landing on top of this one; this element reads its own previous values
+  // (before overwriting them) to avoid re-landing on the same spot.
+  // hasPosition is false until this element's first real transition has
+  // actually placed something — nothing to avoid-repeat or avoid-collide
+  // against before that.
+  int16_t posX, posY;
+  int16_t halfW, halfH;
+  bool hasPosition;
 };
 IdleElement idleTimeElement;
 IdleElement idleDateElement;
@@ -439,34 +456,94 @@ IdleElement idleDateElement;
 constexpr const lv_font_t *IDLE_FONT_POOL[] = {
     &lv_font_montserrat_28, &lv_font_montserrat_42, &lv_font_montserrat_48};
 constexpr size_t IDLE_FONT_POOL_COUNT = sizeof(IDLE_FONT_POOL) / sizeof(IDLE_FONT_POOL[0]);
-// T42: pushed well outward from T41's tight ±24px central cluster, toward
-// this panel's actual usable area — 2.04" round 390x390 (HARDWARE.md), so
-// true rectangular corners clip against the round bezel; offsets here stay
-// cardinal/diagonal-biased within a radius that keeps the largest pooled
-// font (48pt) and longest expected string ("Wed Aug 26") fully inside the
-// visible circle rather than reaching for literal screen corners. Date and
-// time each pick independently and aren't collision-checked against each
-// other, so they may occasionally land close together — the wide spread
-// makes that rare; revisit if it shows up as a real problem on-device.
-constexpr int8_t IDLE_POSITION_POOL[][2] = {
-    {0, 0},      {0, -100},   {0, 100},    {-105, 0},   {105, 0},
-    {-80, -80},  {80, -80},   {-80, 80},   {80, 80},
-    {-60, -95},  {60, -95},   {-60, 95},   {60, 95},
-    {-95, -60},  {95, -60},   {-95, 60},   {95, 60}};
-constexpr size_t IDLE_POSITION_POOL_COUNT = sizeof(IDLE_POSITION_POOL) / sizeof(IDLE_POSITION_POOL[0]);
-// T42: randomized per-cycle within this range instead of T41's flat
-// 12000ms — each element re-rolls its own dwell independently every
-// transition, which is what actually keeps date and time drifting out of
-// phase with each other rather than sharing one synchronized cadence (a
-// fixed interval for both would either stay in permanent lockstep if
-// started together, or at best hold one fixed phase offset forever). Range
-// still centered on Brian's original "10-15s" framing from T41.
+// T43: replaced T42's fixed IDLE_POSITION_POOL with real geometry —
+// pickIdlePosition() rejection-samples within this radius and validates the
+// *actual* measured text box against it, rather than trusting a hand-picked
+// offset to be safe for every font/string combo.
+constexpr int16_t IDLE_PANEL_RADIUS = 195; // 2.04" round 390x390 panel (HARDWARE.md), diameter/2
+constexpr int16_t IDLE_SAFE_RADIUS = 185;  // small inward margin from the true bezel edge
+constexpr int16_t IDLE_MIN_REPEAT_DISTANCE_PX = 50; // must move at least this far from its own last spot (bug #3)
+constexpr int16_t IDLE_MIN_ELEMENT_GAP_PX = 10;     // required clear gap between the two elements' boxes (bug #2)
+constexpr int IDLE_POSITION_ATTEMPTS_PER_TIER = 40; // random tries before pickIdlePosition() relaxes a constraint
+// Randomized per-cycle rather than a flat interval — each element re-rolls
+// its own dwell independently every transition, which is what actually keeps
+// date and time drifting out of phase with each other rather than sharing
+// one synchronized cadence (a fixed interval for both would either stay in
+// permanent lockstep if started together, or at best hold one fixed phase
+// offset forever). Range centered on Brian's original "10-15s" framing from
+// T41.
 constexpr uint32_t IDLE_DWELL_MIN_MS = 9000;
 constexpr uint32_t IDLE_DWELL_MAX_MS = 15000;
 constexpr uint32_t IDLE_FADE_MS = 1500; // cross-fade duration — unchanged from T41, "~1-2s" per Brian
 
 void idleFadeAnimCb(void *obj, int32_t value) {
   lv_obj_set_style_text_opa((lv_obj_t *)obj, (lv_opa_t)value, 0);
+}
+
+// Does the (cx,cy)-centered box with the given half-extents stay fully
+// inside the panel's visible circle? Checks all 4 corners, not just the
+// center point — the fix for bug #1 (T43): a box can be well inside the
+// square coordinate frame LVGL positions against and still clip against the
+// physical round bezel once the text's real width/height are accounted for.
+bool idleBoxFitsCircle(int16_t cx, int16_t cy, int16_t halfW, int16_t halfH, int16_t radius) {
+  for (int8_t sx = -1; sx <= 1; sx += 2) {
+    for (int8_t sy = -1; sy <= 1; sy += 2) {
+      int32_t px = cx + sx * halfW;
+      int32_t py = cy + sy * halfH;
+      if (px * px + py * py > (int32_t)radius * radius) return false;
+    }
+  }
+  return true;
+}
+
+// Plain axis-aligned-bounding-box overlap test, padded by a required clear
+// gap — used to keep the two elements' boxes apart (bug #2).
+bool idleBoxesTooClose(int16_t ax, int16_t ay, int16_t aHalfW, int16_t aHalfH,
+                        int16_t bx, int16_t by, int16_t bHalfW, int16_t bHalfH, int16_t gap) {
+  bool separatedX = (ax + aHalfW + gap < bx - bHalfW) || (bx + bHalfW + gap < ax - aHalfW);
+  bool separatedY = (ay + aHalfH + gap < by - bHalfH) || (by + bHalfH + gap < ay - aHalfH);
+  return !(separatedX || separatedY);
+}
+
+// Rejection-samples a position for a box of the given half-extents (the
+// *actual* measured size of this cycle's font+string, from
+// lv_text_get_size() at the call site). Three tiers, each strictly more
+// permissive than the last, tried in order — circle-fit is never relaxed
+// (clipping off the visible panel is bug #1, the one actually being fixed
+// here); avoid-repeat (bug #3) and avoid-the-other-element (bug #2) are
+// best-effort and only dropped if no valid spot can be found while honoring
+// them, so a genuinely crowded case degrades to "may repeat" or "may
+// overlap" rather than "may clip."
+void pickIdlePosition(int16_t halfW, int16_t halfH, const IdleElement &self, const IdleElement &other,
+                       int16_t *outX, int16_t *outY) {
+  for (int tier = 0; tier < 3; tier++) {
+    bool requireRepeatDistance = (tier == 0);
+    bool requireGap = (tier <= 1);
+    for (int attempt = 0; attempt < IDLE_POSITION_ATTEMPTS_PER_TIER; attempt++) {
+      int16_t cx = (int16_t)random(-IDLE_SAFE_RADIUS, IDLE_SAFE_RADIUS + 1);
+      int16_t cy = (int16_t)random(-IDLE_SAFE_RADIUS, IDLE_SAFE_RADIUS + 1);
+      if (!idleBoxFitsCircle(cx, cy, halfW, halfH, IDLE_SAFE_RADIUS)) continue;
+      if (requireRepeatDistance && self.hasPosition) {
+        int32_t dx = cx - self.posX, dy = cy - self.posY;
+        if (dx * dx + dy * dy < (int32_t)IDLE_MIN_REPEAT_DISTANCE_PX * IDLE_MIN_REPEAT_DISTANCE_PX) continue;
+      }
+      if (requireGap && other.hasPosition) {
+        if (idleBoxesTooClose(cx, cy, halfW, halfH, other.posX, other.posY, other.halfW, other.halfH,
+                               IDLE_MIN_ELEMENT_GAP_PX))
+          continue;
+      }
+      *outX = cx;
+      *outY = cy;
+      return;
+    }
+  }
+  // Last resort: dead center. Always the easiest spot to fit inside the
+  // circle for any font/string this project's IDLE_FONT_POOL produces, so
+  // this only actually triggers if the panel is fully crowded out — an
+  // accepted rare degrade (possible repeat/overlap) over an unbounded
+  // search.
+  *outX = 0;
+  *outY = 0;
 }
 
 // Mid-grey, not full white — a slightly muted text color reads more
@@ -491,19 +568,24 @@ void buildIdleScreen(lv_obj_t *scr) {
   idleTimeElement.aIsVisible = true;
   idleTimeElement.lastTransitionMs = 0;
   idleTimeElement.dwellMs = (uint32_t)random(IDLE_DWELL_MIN_MS, IDLE_DWELL_MAX_MS + 1);
+  idleTimeElement.hasPosition = false;
 
   idleDateElement.labelA = buildIdleLabel(scr, "", true); // blank (not a fake date) until first real call
   idleDateElement.labelB = buildIdleLabel(scr, "", false);
   idleDateElement.aIsVisible = true;
   idleDateElement.lastTransitionMs = 0;
   idleDateElement.dwellMs = (uint32_t)random(IDLE_DWELL_MIN_MS, IDLE_DWELL_MAX_MS + 1);
+  idleDateElement.hasPosition = false;
 }
 
 // One element's (time or date) own transition check/cross-fade — see
-// IdleElement's own comment for why each needs two labels. Cheap to call
-// unconditionally, since it only actually does anything once per this
-// element's own dwellMs, not every call.
-void updateIdleElement(IdleElement &el, bool isTime) {
+// IdleElement's own comment for why each needs two labels. `other` is the
+// sibling element (time passes date and vice versa), read-only here, so this
+// element's new position can avoid landing on top of wherever the other one
+// currently is (bug #2). Cheap to call unconditionally, since it only
+// actually does anything once per this element's own dwellMs, not every
+// call.
+void updateIdleElement(IdleElement &el, const IdleElement &other, bool isTime) {
   uint32_t now = millis();
   if (el.lastTransitionMs == 0) {
     el.lastTransitionMs = now; // first call ever — just start this element's own dwell clock, nothing to animate yet
@@ -533,9 +615,28 @@ void updateIdleElement(IdleElement &el, bool isTime) {
     strcpy(buf, isTime ? "--:--" : "");
   }
   lv_label_set_text(incoming, buf);
-  lv_obj_set_style_text_font(incoming, IDLE_FONT_POOL[random(IDLE_FONT_POOL_COUNT)], 0);
-  const int8_t *pos = IDLE_POSITION_POOL[random(IDLE_POSITION_POOL_COUNT)];
-  lv_obj_align(incoming, LV_ALIGN_CENTER, pos[0], pos[1]);
+  const lv_font_t *font = IDLE_FONT_POOL[random(IDLE_FONT_POOL_COUNT)];
+  lv_obj_set_style_text_font(incoming, font, 0);
+
+  // T43: measure the *actual* rendered box for this cycle's real font+string
+  // (not a hand-picked guess) so pickIdlePosition() can check it against the
+  // panel's real round boundary — the fix for bug #1. No custom letter/line
+  // spacing is set on these labels, so 0/0 here matches how they actually
+  // render; +2px padding on each half-extent covers anti-aliasing overshoot.
+  lv_point_t textSize;
+  lv_text_get_size(&textSize, buf, font, 0, 0, LV_COORD_MAX, LV_TEXT_FLAG_NONE);
+  int16_t halfW = (int16_t)(textSize.x / 2) + 2;
+  int16_t halfH = (int16_t)(textSize.y / 2) + 2;
+
+  int16_t posX, posY;
+  pickIdlePosition(halfW, halfH, el, other, &posX, &posY);
+  lv_obj_align(incoming, LV_ALIGN_CENTER, posX, posY);
+
+  el.posX = posX;
+  el.posY = posY;
+  el.halfW = halfW;
+  el.halfH = halfH;
+  el.hasPosition = true;
 
   lv_anim_t fadeOut;
   lv_anim_init(&fadeOut);
@@ -558,8 +659,8 @@ void updateIdleElement(IdleElement &el, bool isTime) {
 // it stays shown. Time and date transition completely independently of each
 // other — see updateIdleElement()/IDLE_DWELL_MIN_MS/MAX_MS.
 void updateIdleScreen() {
-  updateIdleElement(idleTimeElement, true);
-  updateIdleElement(idleDateElement, false);
+  updateIdleElement(idleTimeElement, idleDateElement, true);
+  updateIdleElement(idleDateElement, idleTimeElement, false);
 }
 
 // Volume screen: the only screen reachable by rotating the knob, from any
