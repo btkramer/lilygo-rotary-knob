@@ -600,6 +600,37 @@ void buildIdleScreen(lv_obj_t *scr) {
   idleDateElement.hasPosition = false;
 }
 
+// Fills *outTm with this device's current local time (UTC + utcOffsetMinutes,
+// see that global's own top-of-file comment) and returns true, or returns
+// false if SNTP hasn't synced yet. Shared by updateIdleElement() and the
+// /debug/time HTTP route (setupHttpOta()) so the same computation can be
+// confirmed remotely without needing physical access to the round panel.
+//
+// getLocalTime(..., 0): a single non-blocking check, never waits — loop()
+// must never block (see the "Docker app sync protocol" section's top
+// comment for why). Returns false until SNTP has actually synced at least
+// once (see setupTimeSync()), e.g. briefly after boot before WiFi finishes
+// connecting. Only used here as that sync-ready check, though — the
+// `timeinfo` it fills is discarded and re-derived below (T44).
+bool getIdleLocalTime(struct tm *outTm) {
+  struct tm timeinfo;
+  if (!getLocalTime(&timeinfo, 0)) return false;
+  // T44 (2026-08-26): local time is now PC-sourced (utcOffsetMinutes, via
+  // pollSyncState()/pcState.utcOffsetMinutes), not a hardcoded POSIX-TZ
+  // string — setupTimeSync() fixes this device's own clock to plain UTC, so
+  // this manual epoch shift is the *only* "local time" conversion that
+  // happens anywhere on this device. gmtime_r (not localtime_r) on the
+  // shifted epoch — using localtime_r again would silently reapply whatever
+  // TZ this device's C library thinks it has (harmless today since that's
+  // fixed to UTC0, but conceptually wrong: the offset already *is* the
+  // local-time conversion).
+  time_t nowUtc;
+  time(&nowUtc);
+  time_t localEpoch = nowUtc + (time_t)utcOffsetMinutes * 60;
+  gmtime_r(&localEpoch, outTm);
+  return true;
+}
+
 // One element's (time or date) own transition check/cross-fade — see
 // IdleElement's own comment for why each needs two labels. `other` is the
 // sibling element (time passes date and vice versa), read-only here, so this
@@ -623,26 +654,7 @@ void updateIdleElement(IdleElement &el, const IdleElement &other, bool isTime) {
 
   struct tm timeinfo;
   char buf[24];
-  // getLocalTime(..., 0): a single non-blocking check, never waits — loop()
-  // must never block (see the "Docker app sync protocol" section's top
-  // comment for why). Returns false until SNTP has actually synced at least
-  // once (see setupTimeSync()), e.g. briefly after boot before WiFi finishes
-  // connecting. Only used here as that sync-ready check, though — the
-  // `timeinfo` it fills is discarded and re-derived below (T44).
-  if (getLocalTime(&timeinfo, 0)) {
-    // T44 (2026-08-26): local time is now PC-sourced (utcOffsetMinutes, via
-    // pollSyncState()/pcState.utcOffsetMinutes), not a hardcoded POSIX-TZ
-    // string — setupTimeSync() fixes this device's own clock to plain UTC,
-    // so this manual epoch shift is the *only* "local time" conversion that
-    // happens anywhere on this device. gmtime_r (not localtime_r) on the
-    // shifted epoch — using localtime_r again would silently reapply
-    // whatever TZ this device's C library thinks it has (harmless today
-    // since that's fixed to UTC0, but conceptually wrong: the offset already
-    // *is* the local-time conversion).
-    time_t nowUtc;
-    time(&nowUtc);
-    time_t localEpoch = nowUtc + (time_t)utcOffsetMinutes * 60;
-    gmtime_r(&localEpoch, &timeinfo);
+  if (getIdleLocalTime(&timeinfo)) {
     // Standard (non-GNU) strftime specifiers only — the toolchain's libc
     // here is a trimmed embedded newlib, not glibc, so the "%-I"/"%-d"
     // no-leading-zero GNU extensions aren't something to rely on.
@@ -2390,6 +2402,32 @@ void setupHttpOta() {
     rebootAtMs = millis() + 500; // let the response flush before ESP.restart() tears the connection down
   });
   Serial.println("Remote restart ready at /restart");
+
+  // T44 (2026-08-26): read-only diagnostic — confirms utcOffsetMinutes/
+  // timeZoneName and this device's own computed local time remotely (e.g.
+  // `curl` over SSH) without needing physical access to the round panel or a
+  // WebSerial browser session. Same auth/host reasoning as /restart above.
+  // getIdleLocalTime() is the exact same computation updateIdleElement()
+  // uses for the idle screen itself, so this reads what the panel would
+  // actually show, not a separate guess.
+  webServer.on("/debug/time", HTTP_GET, [](AsyncWebServerRequest *request) {
+    if (!request->authenticate("ota", OTA_PASSWORD)) {
+      return request->requestAuthentication();
+    }
+    struct tm localTm;
+    char body[192];
+    if (getIdleLocalTime(&localTm)) {
+      char localStr[48];
+      strftime(localStr, sizeof(localStr), "%I:%M:%S %p %a %b %d %Y", &localTm);
+      snprintf(body, sizeof(body), "utcOffsetMinutes=%d timeZoneName=\"%s\" localTime=\"%s\"\n", utcOffsetMinutes,
+               timeZoneName.c_str(), localStr);
+    } else {
+      snprintf(body, sizeof(body), "utcOffsetMinutes=%d timeZoneName=\"%s\" localTime=unsynced (SNTP hasn't landed yet)\n",
+               utcOffsetMinutes, timeZoneName.c_str());
+    }
+    request->send(200, "text/plain", body);
+  });
+  Serial.println("Debug time readout ready at /debug/time");
 }
 
 void setup() {
