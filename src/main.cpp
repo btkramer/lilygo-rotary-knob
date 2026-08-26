@@ -470,10 +470,12 @@ constexpr int IDLE_POSITION_ATTEMPTS_PER_TIER = 40; // random tries before pickI
 // date and time drifting out of phase with each other rather than sharing
 // one synchronized cadence (a fixed interval for both would either stay in
 // permanent lockstep if started together, or at best hold one fixed phase
-// offset forever). Range centered on Brian's original "10-15s" framing from
-// T41.
-constexpr uint32_t IDLE_DWELL_MIN_MS = 9000;
-constexpr uint32_t IDLE_DWELL_MAX_MS = 15000;
+// offset forever). T45 (2026-08-26): roughly doubled from T41/T42's 9-15s —
+// Brian wanted the cycle slower after living with it, no exact target given
+// (same "pick something reasonable, he'll iterate live" pattern as T41's
+// original cycle-slowdown ask).
+constexpr uint32_t IDLE_DWELL_MIN_MS = 20000;
+constexpr uint32_t IDLE_DWELL_MAX_MS = 30000;
 constexpr uint32_t IDLE_FADE_MS = 1500; // cross-fade duration — unchanged from T41, "~1-2s" per Brian
 
 void idleFadeAnimCb(void *obj, int32_t value) {
