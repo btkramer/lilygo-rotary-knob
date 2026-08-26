@@ -378,6 +378,26 @@ void buildHomeScreen(lv_obj_t *scr) {
   updateHomeScreen();
 }
 
+// T44 (2026-08-26): the idle screen's clock's authoritative local-time
+// source — see setupTimeSync()'s own comment (further down) for why this
+// device's own clock is fixed to plain UTC and this offset (minutes east of
+// UTC, e.g. -420 for Phoenix, AZ, no DST — pc-dash-app's own reasoning per
+// the coordinator: correctly reducing Windows' DST rules to a POSIX TZ
+// string is hard to verify and fails silently, twice a year, whereas an
+// offset needs zero DST logic on either end and self-corrects every report)
+// is the only local-time conversion applied, in updateIdleElement() below.
+// Declared up here (rather than alongside the other sync-derived settings,
+// dimDelayMs etc., much further down) because updateIdleElement() needs it
+// and appears first in the file. Sourced from pcState via pollSyncState(),
+// same "falls back to the last-synced/NVS value until a poll supplies a
+// real one" pattern as volumeFuseMs/idleToHomeMs/dimDelayMs — defaults to 0
+// (shows plain UTC) until the first real value lands. timeZoneName is
+// cosmetic only (pc-dash-app's own wording) — never used for time math, not
+// currently rendered anywhere; kept only so it's on hand if a future screen
+// wants to display it.
+int32_t utcOffsetMinutes = 0;
+String timeZoneName = "";
+
 // Burn-in-mitigation idle screen (T40, 2026-08-25). Visual treatment redone
 // for T41 (2026-08-25), T42 (2026-08-26), and T43 (2026-08-26) — each round
 // Brian's own direct feedback after living with the previous one on the
@@ -607,8 +627,22 @@ void updateIdleElement(IdleElement &el, const IdleElement &other, bool isTime) {
   // must never block (see the "Docker app sync protocol" section's top
   // comment for why). Returns false until SNTP has actually synced at least
   // once (see setupTimeSync()), e.g. briefly after boot before WiFi finishes
-  // connecting.
+  // connecting. Only used here as that sync-ready check, though — the
+  // `timeinfo` it fills is discarded and re-derived below (T44).
   if (getLocalTime(&timeinfo, 0)) {
+    // T44 (2026-08-26): local time is now PC-sourced (utcOffsetMinutes, via
+    // pollSyncState()/pcState.utcOffsetMinutes), not a hardcoded POSIX-TZ
+    // string — setupTimeSync() fixes this device's own clock to plain UTC,
+    // so this manual epoch shift is the *only* "local time" conversion that
+    // happens anywhere on this device. gmtime_r (not localtime_r) on the
+    // shifted epoch — using localtime_r again would silently reapply
+    // whatever TZ this device's C library thinks it has (harmless today
+    // since that's fixed to UTC0, but conceptually wrong: the offset already
+    // *is* the local-time conversion).
+    time_t nowUtc;
+    time(&nowUtc);
+    time_t localEpoch = nowUtc + (time_t)utcOffsetMinutes * 60;
+    gmtime_r(&localEpoch, &timeinfo);
     // Standard (non-GNU) strftime specifiers only — the toolchain's libc
     // here is a trimmed embedded newlib, not glibc, so the "%-I"/"%-d"
     // no-leading-zero GNU extensions aren't something to rely on.
@@ -1971,6 +2005,8 @@ struct SyncResult {
   uint32_t volumeFuseMs;
   uint32_t idleToHomeMs;
   uint32_t dimDelayMs; // T40, see its own top-of-file comment
+  int32_t utcOffsetMinutes; // T44, see its own top-of-file comment — preserved unless pcState has a real value
+  String timeZoneName;      // T44, cosmetic only — see its own top-of-file comment
   // pcState's volume/mute/now-playing fields (T14, 2026-08-21) — parsed
   // unconditionally below, but loop() only ever applies them when
   // result.pcConnected is true (see loop()'s sync-apply step and
@@ -2020,6 +2056,7 @@ bool pollSyncState() {
   result.volumeFuseMs = volumeFuseMs; // preserved unless the payload has a real value
   result.idleToHomeMs = idleToHomeMs;
   result.dimDelayMs = dimDelayMs;
+  result.utcOffsetMinutes = utcOffsetMinutes; // T44, same preserved-unless-real-value pattern
   result.pcConnected = false;
   result.lastSeenSecondsAgo = 0;
   // Left at these neutral defaults (not read from the local globals — those
@@ -2035,6 +2072,7 @@ bool pollSyncState() {
   result.nowPlayingSource = "";
   result.nowPlayingPositionMs = 0;
   result.nowPlayingDurationMs = 0;
+  result.timeZoneName = ""; // cosmetic-only, safe to blip empty on a transient parse — unlike utcOffsetMinutes, not preserved
   result.ok = false;
 
   if (WiFi.status() == WL_CONNECTED) {
@@ -2072,6 +2110,17 @@ bool pollSyncState() {
         JsonObject pcState = doc["pcState"];
         result.pcConnected = pcState["pcConnected"] | false;
         result.lastSeenSecondsAgo = pcState["lastSeenSecondsAgo"] | 0;
+        // T44 (2026-08-26): local-time source for the idle screen, confirmed
+        // shape from pc-dash-app via the coordinator — utcOffsetMinutes
+        // (signed minutes east of UTC, e.g. -420 for Phoenix, AZ; see
+        // setupTimeSync()'s comment for why an offset instead of a POSIX TZ
+        // string) is the authoritative value, preserved (not reset to 0)
+        // when absent so a PC-side field not live yet, or a momentary
+        // disconnect, doesn't snap the clock back to plain UTC.
+        // timeZoneName is cosmetic only — see its own top-of-file comment.
+        result.utcOffsetMinutes = pcState["utcOffsetMinutes"] | utcOffsetMinutes;
+        result.timeZoneName = String((const char *)(pcState["timeZoneName"] | ""));
+        if (result.utcOffsetMinutes != utcOffsetMinutes) syncPrefs.putInt("utcOffMin", result.utcOffsetMinutes);
         result.volumePercent = pcState["volumePercent"] | 0;
         result.speakerMuted = pcState["speakerMuted"] | false;
         result.nowPlayingIsPlaying = pcState["nowPlayingIsPlaying"] | false;
@@ -2127,8 +2176,9 @@ void setupSyncSettings() {
   volumeFuseMs = syncPrefs.getUInt("volFuseMs", VOLUME_FUSE_MS_DEFAULT);
   idleToHomeMs = syncPrefs.getUInt("idleMs", IDLE_TO_HOME_MS_DEFAULT);
   dimDelayMs = syncPrefs.getUInt("dimDelayMs", DIM_DELAY_MS_DEFAULT);
-  Serial.printf("sync: loaded from NVS: volumeFuseMs=%u idleToHomeMs=%u dimDelayMs=%u\n",
-                volumeFuseMs, idleToHomeMs, dimDelayMs);
+  utcOffsetMinutes = syncPrefs.getInt("utcOffMin", 0); // T44 — 0 (plain UTC) until a real value has ever synced
+  Serial.printf("sync: loaded from NVS: volumeFuseMs=%u idleToHomeMs=%u dimDelayMs=%u utcOffsetMinutes=%d\n",
+                volumeFuseMs, idleToHomeMs, dimDelayMs, utcOffsetMinutes);
 
   syncResultMutex = xSemaphoreCreateMutex();
   xTaskCreatePinnedToCore(syncPollTask, "syncPoll", 8192, NULL, 1, NULL, 0);
@@ -2178,17 +2228,23 @@ void setupOTA() {
 }
 
 // T40 (2026-08-25): NTP time sync for the idle screen's clock — nothing on
-// this board read/needed wall-clock time before this. configTzTime() sets
-// both the TZ env var (secrets.h's TIMEZONE_POSIX, a POSIX TZ string so DST
-// is handled automatically) and starts SNTP in one call; it doesn't block —
-// getLocalTime() (see updateIdleScreen()) just returns false until the first
-// sync actually lands. Only called once WiFi is up (same "no WiFi, no X"
-// degradation as OTA/WebSerial above) — the idle screen shows a placeholder
-// until then.
+// this board read/needed wall-clock time before this. configTzTime() starts
+// SNTP and sets the TZ env var in one call; it doesn't block — getLocalTime()
+// (see updateIdleElement()) just returns false until the first sync actually
+// lands. Only called once WiFi is up (same "no WiFi, no X" degradation as
+// OTA/WebSerial above) — the idle screen shows a placeholder until then.
+//
+// T44 (2026-08-26): TZ fixed to plain "UTC0", not secrets.h's old
+// TIMEZONE_POSIX constant (now unused/removed there) — local time is sourced
+// from the PC's own clock instead (utcOffsetMinutes, applied manually in
+// updateIdleElement()), so this device's own clock only ever needs to be
+// correct UTC, with zero POSIX-TZ/DST logic on this end. Brian no longer
+// needs to set/maintain a real TZ string here; the PC-reported offset
+// self-corrects if the PC's own timezone ever changes.
 void setupTimeSync() {
   if (WiFi.status() != WL_CONNECTED) return;
-  configTzTime(TIMEZONE_POSIX, "pool.ntp.org", "time.nist.gov");
-  Serial.println("Time sync started (SNTP)");
+  configTzTime("UTC0", "pool.ntp.org", "time.nist.gov");
+  Serial.println("Time sync started (SNTP, UTC)");
 }
 
 // Debug console over WiFi (http://<device-ip>/webserial) — added 2026-08-07
@@ -2398,6 +2454,8 @@ void loop() {
       volumeFuseMs = result.volumeFuseMs;
       idleToHomeMs = result.idleToHomeMs;
       dimDelayMs = result.dimDelayMs;
+      utcOffsetMinutes = result.utcOffsetMinutes; // T44 — applied unconditionally, same as the timeouts above
+      if (!result.timeZoneName.isEmpty()) timeZoneName = result.timeZoneName; // cosmetic only; don't blank it out on a transient miss
 
       // Volume/mute/now-playing: only trust the payload once the companion
       // app has actually reported in on *this* poll (result.pcConnected) —
