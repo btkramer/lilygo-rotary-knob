@@ -378,65 +378,107 @@ void buildHomeScreen(lv_obj_t *scr) {
   updateHomeScreen();
 }
 
-// Burn-in-mitigation idle screen (T40, 2026-08-25; visual treatment redone
-// for T41, same day, after Brian saw T40 live). See ECOSYSTEM_PLAN.md's
-// "Burn-in mitigation" section for the original design background.
+// Burn-in-mitigation idle screen (T40, 2026-08-25). Visual treatment redone
+// for T41 (2026-08-25) after Brian saw T40 live, then again for T42
+// (2026-08-26) after Brian saw T41 live. See ECOSYSTEM_PLAN.md's "Burn-in
+// mitigation" section for the original design background.
 //
-// T41 changes, each Brian's own explicit feedback after watching T40 run:
-// - **Dropped the separate pixel-shift mechanism entirely** — redundant once
-//   content/font/position all already vary every cycle (below); shifting a
-//   handful of px on top of that was no longer doing distinct work.
-// - **Brightness raised to DISPLAY_BRIGHTNESS_IDLE** (~75% of full range,
-//   see that constant's own comment) — T40's original level read as too dim
-//   to actually be useful as an ambient glance.
-// - **Cross-fade between states** (idleFadeAnimCb below) instead of a hard
-//   text swap, and a slower overall cycle — see IDLE_DWELL_MS/IDLE_FADE_MS.
-// - **Font and position both vary every cycle**, drawn from small pools
-//   below, not just alternating between two fixed states — the actual
-//   burn-in-relevant goal Brian named directly: no small group of pixels
-//   should hold the same on/off state indefinitely. Doesn't need to be an
-//   exhaustive combination matrix, just varied enough.
+// T42 changes, each Brian's own explicit feedback after watching T41 run:
+// - **Date and time shown simultaneously, not alternating** — each is its
+//   own independent element with its own independently-random position, not
+//   paired/mirrored to the same spot or treated as one unit.
+// - **Independent fade cycles per element** — date and time each fade out
+//   and back in on their own schedule, landing at a freshly-picked random
+//   position/font every time, deliberately drifting out of phase with each
+//   other rather than sharing one synchronized cadence (see
+//   IDLE_DWELL_MIN_MS/IDLE_DWELL_MAX_MS below).
+// - **Dropped the two smallest font sizes** (22/24) from the pool — too
+//   small to read comfortably at a glance, more so now that two elements
+//   share the screen instead of one owning the whole display.
+// - **Position pool widened** well beyond T41's tight central cluster,
+//   toward the panel's actual usable edges — both a more dynamic look and,
+//   per Brian, the actual burn-in-relevant point: spread wear across more of
+//   the physical pixels instead of reusing the same central handful
+//   repeatedly.
 //
-// Still deliberately just a clock with no continuous animation (a live-
-// ticking seconds display would mean a full-panel redraw every second
-// indefinitely while idle — exactly what HARDWARE.md's "full-frame redraws
-// only" rule warns against); the cross-fade itself is a brief, occasional
-// opacity animation on a plain label (proven safe on this hardware already —
-// see speakerMutePulseAnimCb/nowPlayingGlowAnimCb, same technique), not a
-// live lv_arc, so it doesn't run into that rule's actual hazard.
+// T41's carryovers, unchanged: brightness (DISPLAY_BRIGHTNESS_IDLE), no
+// separate pixel-shift mechanism (redundant once content/font/position all
+// vary independently), cross-fade via idleFadeAnimCb (plain opacity anim on
+// a label, same proven-safe technique as speakerMutePulseAnimCb/
+// nowPlayingGlowAnimCb — not an lv_arc, so it doesn't run into HARDWARE.md's
+// animated-arc hazard), and no live-ticking seconds display (a full-panel
+// redraw every second indefinitely while idle is exactly what HARDWARE.md's
+// "full-frame redraws only" rule warns against).
 lv_obj_t *idleScreen;
-// Two labels, cross-faded between — see updateIdleScreen()'s own comment for
-// why a single label can't cross-dissolve between two different text
-// strings on its own.
-lv_obj_t *idleLabelA;
-lv_obj_t *idleLabelB;
+
+// Each element (time, date) is its own independent two-label cross-fade
+// pair — a single lv_label can't cross-dissolve between two different text
+// strings on its own (no per-glyph interpolation), so each element keeps two
+// overlapping labels and alternates which one is "incoming" (fading in at a
+// freshly-picked font/position) vs. "outgoing" (fading out wherever it
+// already was). T41 had only one such pair, alternating between showing time
+// and date content; T42 needs both visible at once, so each now gets its own
+// pair plus its own independent timing state.
+struct IdleElement {
+  lv_obj_t *labelA;
+  lv_obj_t *labelB;
+  bool aIsVisible;
+  uint32_t lastTransitionMs;
+  uint32_t dwellMs; // this element's current wait — re-rolled every transition, see IDLE_DWELL_MIN_MS/MAX_MS
+};
+IdleElement idleTimeElement;
+IdleElement idleDateElement;
 
 // Font pool: every Montserrat size already enabled in lv_conf.h for other
 // screens (see each one's own bundled-font comment there) — no new font
-// assets needed. Deliberately not trying to add real bold/regular *weight*
+// assets needed. T42: dropped 22/24 (Brian: too small to read comfortably at
+// a glance). Deliberately not trying to add real bold/regular *weight*
 // variants (LVGL's bundled fonts are one weight per size) — varying size
 // already changes each glyph's actual lit pixels meaningfully, which is the
 // part that matters here.
 constexpr const lv_font_t *IDLE_FONT_POOL[] = {
-    &lv_font_montserrat_22, &lv_font_montserrat_24, &lv_font_montserrat_28,
-    &lv_font_montserrat_42, &lv_font_montserrat_48};
+    &lv_font_montserrat_28, &lv_font_montserrat_42, &lv_font_montserrat_48};
 constexpr size_t IDLE_FONT_POOL_COUNT = sizeof(IDLE_FONT_POOL) / sizeof(IDLE_FONT_POOL[0]);
-// Wider spread than T40's original ±4px pixel-shift — that amplitude was
-// deliberately tiny because it was the *only* thing varying and a bigger
-// jump would've looked like a glitch; now that font/content already change
-// visibly every cycle, a more noticeable reshuffle reads as intentional
-// instead. Kept within a safe margin of this round display's usable center
-// area for the largest pooled font (48pt) with the longest expected string
-// ("Wed Aug 26" / "12:00 PM").
+// T42: pushed well outward from T41's tight ±24px central cluster, toward
+// this panel's actual usable area — 2.04" round 390x390 (HARDWARE.md), so
+// true rectangular corners clip against the round bezel; offsets here stay
+// cardinal/diagonal-biased within a radius that keeps the largest pooled
+// font (48pt) and longest expected string ("Wed Aug 26") fully inside the
+// visible circle rather than reaching for literal screen corners. Date and
+// time each pick independently and aren't collision-checked against each
+// other, so they may occasionally land close together — the wide spread
+// makes that rare; revisit if it shows up as a real problem on-device.
 constexpr int8_t IDLE_POSITION_POOL[][2] = {
-    {0, 0}, {24, -18}, {-22, 14}, {18, 20}, {-24, -14},
-    {14, -22}, {-16, 18}, {20, 8}, {-20, -20}, {8, 22}};
+    {0, 0},      {0, -100},   {0, 100},    {-105, 0},   {105, 0},
+    {-80, -80},  {80, -80},   {-80, 80},   {80, 80},
+    {-60, -95},  {60, -95},   {-60, 95},   {60, 95},
+    {-95, -60},  {95, -60},   {-95, 60},   {95, 60}};
 constexpr size_t IDLE_POSITION_POOL_COUNT = sizeof(IDLE_POSITION_POOL) / sizeof(IDLE_POSITION_POOL[0]);
-constexpr uint32_t IDLE_DWELL_MS = 12000; // time between the start of one transition and the next — "10-15s" per Brian
-constexpr uint32_t IDLE_FADE_MS = 1500;   // cross-fade duration — "~1-2s" per Brian
+// T42: randomized per-cycle within this range instead of T41's flat
+// 12000ms — each element re-rolls its own dwell independently every
+// transition, which is what actually keeps date and time drifting out of
+// phase with each other rather than sharing one synchronized cadence (a
+// fixed interval for both would either stay in permanent lockstep if
+// started together, or at best hold one fixed phase offset forever). Range
+// still centered on Brian's original "10-15s" framing from T41.
+constexpr uint32_t IDLE_DWELL_MIN_MS = 9000;
+constexpr uint32_t IDLE_DWELL_MAX_MS = 15000;
+constexpr uint32_t IDLE_FADE_MS = 1500; // cross-fade duration — unchanged from T41, "~1-2s" per Brian
 
 void idleFadeAnimCb(void *obj, int32_t value) {
   lv_obj_set_style_text_opa((lv_obj_t *)obj, (lv_opa_t)value, 0);
+}
+
+// Mid-grey, not full white — a slightly muted text color reads more
+// deliberately "ambient" than stark white against pure black.
+lv_obj_t *buildIdleLabel(lv_obj_t *scr, const char *initialText, bool visible) {
+  lv_obj_t *label = lv_label_create(scr);
+  lv_obj_set_style_text_font(label, IDLE_FONT_POOL[0], 0);
+  lv_obj_set_style_text_color(label, lv_color_hex(0x808080), 0);
+  lv_obj_center(label);
+  lv_label_set_text(label, initialText);
+  lv_obj_set_style_text_opa(label, visible ? LV_OPA_COVER : LV_OPA_TRANSP, 0);
+  return label;
 }
 
 void buildIdleScreen(lv_obj_t *scr) {
@@ -444,46 +486,36 @@ void buildIdleScreen(lv_obj_t *scr) {
   lv_obj_set_style_bg_opa(scr, LV_OPA_COVER, 0);
   lv_obj_remove_flag(scr, LV_OBJ_FLAG_SCROLLABLE);
 
-  // Mid-grey, not full white, on both labels — a slightly muted text color
-  // reads more deliberately "ambient" than stark white against pure black.
-  idleLabelA = lv_label_create(scr);
-  lv_obj_set_style_text_font(idleLabelA, IDLE_FONT_POOL[0], 0);
-  lv_obj_set_style_text_color(idleLabelA, lv_color_hex(0x808080), 0);
-  lv_obj_center(idleLabelA);
-  lv_label_set_text(idleLabelA, "--:--"); // placeholder until updateIdleScreen()'s first real call
+  idleTimeElement.labelA = buildIdleLabel(scr, "--:--", true); // placeholder until updateIdleScreen()'s first real call
+  idleTimeElement.labelB = buildIdleLabel(scr, "", false);     // hidden until the first cross-fade brings it in
+  idleTimeElement.aIsVisible = true;
+  idleTimeElement.lastTransitionMs = 0;
+  idleTimeElement.dwellMs = (uint32_t)random(IDLE_DWELL_MIN_MS, IDLE_DWELL_MAX_MS + 1);
 
-  idleLabelB = lv_label_create(scr);
-  lv_obj_set_style_text_font(idleLabelB, IDLE_FONT_POOL[0], 0);
-  lv_obj_set_style_text_color(idleLabelB, lv_color_hex(0x808080), 0);
-  lv_obj_center(idleLabelB);
-  lv_label_set_text(idleLabelB, "");
-  lv_obj_set_style_text_opa(idleLabelB, LV_OPA_TRANSP, 0); // hidden until the first cross-fade brings it in
+  idleDateElement.labelA = buildIdleLabel(scr, "", true); // blank (not a fake date) until first real call
+  idleDateElement.labelB = buildIdleLabel(scr, "", false);
+  idleDateElement.aIsVisible = true;
+  idleDateElement.lastTransitionMs = 0;
+  idleDateElement.dwellMs = (uint32_t)random(IDLE_DWELL_MIN_MS, IDLE_DWELL_MAX_MS + 1);
 }
 
-// Called once right before this screen is shown, and every loop() pass while
-// it stays shown — cheap to call unconditionally, since it only actually
-// does anything once per IDLE_DWELL_MS, not every call. A single lv_label
-// can't cross-dissolve between two different text strings on its own (no
-// per-glyph interpolation), so this keeps two overlapping labels and
-// alternates which one is "incoming" (fading 0->COVER at a freshly-picked
-// font/position) vs. "outgoing" (fading COVER->0 wherever it already was).
-void updateIdleScreen() {
-  static uint32_t lastTransitionMs = 0;
-  static bool showingTime = true; // which *content* is about to become visible
-  static bool aIsVisible = true;  // which *label* is currently the visible one
-
+// One element's (time or date) own transition check/cross-fade — see
+// IdleElement's own comment for why each needs two labels. Cheap to call
+// unconditionally, since it only actually does anything once per this
+// element's own dwellMs, not every call.
+void updateIdleElement(IdleElement &el, bool isTime) {
   uint32_t now = millis();
-  if (lastTransitionMs == 0) {
-    lastTransitionMs = now; // first call ever — just start the dwell clock, nothing to animate yet
+  if (el.lastTransitionMs == 0) {
+    el.lastTransitionMs = now; // first call ever — just start this element's own dwell clock, nothing to animate yet
     return;
   }
-  if (now - lastTransitionMs < IDLE_DWELL_MS) return;
-  lastTransitionMs = now;
-  showingTime = !showingTime;
+  if (now - el.lastTransitionMs < el.dwellMs) return;
+  el.lastTransitionMs = now;
+  el.dwellMs = (uint32_t)random(IDLE_DWELL_MIN_MS, IDLE_DWELL_MAX_MS + 1); // re-roll for next cycle
 
-  lv_obj_t *outgoing = aIsVisible ? idleLabelA : idleLabelB;
-  lv_obj_t *incoming = aIsVisible ? idleLabelB : idleLabelA;
-  aIsVisible = !aIsVisible;
+  lv_obj_t *outgoing = el.aIsVisible ? el.labelA : el.labelB;
+  lv_obj_t *incoming = el.aIsVisible ? el.labelB : el.labelA;
+  el.aIsVisible = !el.aIsVisible;
 
   struct tm timeinfo;
   char buf[24];
@@ -496,9 +528,9 @@ void updateIdleScreen() {
     // Standard (non-GNU) strftime specifiers only — the toolchain's libc
     // here is a trimmed embedded newlib, not glibc, so the "%-I"/"%-d"
     // no-leading-zero GNU extensions aren't something to rely on.
-    strftime(buf, sizeof(buf), showingTime ? "%I:%M %p" : "%a %b %d", &timeinfo);
+    strftime(buf, sizeof(buf), isTime ? "%I:%M %p" : "%a %b %d", &timeinfo);
   } else {
-    strcpy(buf, "--:--");
+    strcpy(buf, isTime ? "--:--" : "");
   }
   lv_label_set_text(incoming, buf);
   lv_obj_set_style_text_font(incoming, IDLE_FONT_POOL[random(IDLE_FONT_POOL_COUNT)], 0);
@@ -520,6 +552,14 @@ void updateIdleScreen() {
   lv_anim_set_values(&fadeIn, LV_OPA_TRANSP, LV_OPA_COVER);
   lv_anim_set_time(&fadeIn, IDLE_FADE_MS);
   lv_anim_start(&fadeIn);
+}
+
+// Called once right before this screen is shown, and every loop() pass while
+// it stays shown. Time and date transition completely independently of each
+// other — see updateIdleElement()/IDLE_DWELL_MIN_MS/MAX_MS.
+void updateIdleScreen() {
+  updateIdleElement(idleTimeElement, true);
+  updateIdleElement(idleDateElement, false);
 }
 
 // Volume screen: the only screen reachable by rotating the knob, from any
@@ -2612,7 +2652,7 @@ void loop() {
     // Home load.
     if (lv_screen_active() == idleScreen) lv_screen_load(homeScreen);
   } else if (shouldBeIdle && displayDimmed && lv_screen_active() == idleScreen) {
-    updateIdleScreen(); // keep alternating time/date and pixel-shifting while it stays shown
+    updateIdleScreen(); // keep date/time each independently cross-fading to a new position while it stays shown
   }
 
   delay(5); // matches Arduino_GFX's own LVGL example's loop cadence
