@@ -400,10 +400,23 @@ String timeZoneName = "";
 
 // Burn-in-mitigation idle screen (T40, 2026-08-25). Visual treatment redone
 // for T41 (2026-08-25), T42 (2026-08-26), T43 (2026-08-26), T47 (2026-08-26),
-// T49 (2026-08-26), and T50 (2026-08-26) — each round Brian's own direct
-// feedback after living with the previous one on the physical device. See
-// ECOSYSTEM_PLAN.md's "Burn-in mitigation" section for the original design
-// background.
+// T49 (2026-08-26), T50 (2026-08-26), and T51 (2026-08-26) — each round
+// Brian's own direct feedback after living with the previous one on the
+// physical device. See ECOSYSTEM_PLAN.md's "Burn-in mitigation" section for
+// the original design background.
+//
+// T51, Brian's own explicit answer to T50's residual-overlap tradeoff:
+// don't just accept a compromised (still-possibly-overlapping) placement at
+// whatever font size a cycle happened to randomly pick — first check
+// whether a *smaller* font in the pool can find a fully clear spot instead,
+// and only fall all the way back to a compromised placement (at the
+// pool's smallest font) once every size has been tried and failed.
+// pickIdleFontAndPosition() (below) now owns choosing the font *and* the
+// position together — walks from the randomly-picked font size down
+// through the pool, retrying pickIdlePosition() (which now reports whether
+// it found a truly perfect candidate, not just a best-effort one) at each
+// size until one succeeds or the smallest size itself becomes the final,
+// most-forgiving attempt.
 //
 // T50: Brian kept seeing a plain overlap even after T49 — confirmed
 // steady-state, not boot-adjacent (so not a T49 recurrence; that fix
@@ -595,6 +608,12 @@ int32_t idleBoxClearance(int16_t ax, int16_t ay, int16_t aHalfW, int16_t aHalfH,
   return xGap > yGap ? xGap : yGap;
 }
 
+// T51 (2026-08-26): now returns whether the candidate actually found is
+// *perfect* (repeat-safe and gap-clear) or only best-effort — see
+// pickIdleFontAndPosition() below, which uses this to retry the whole
+// search at a smaller font size instead of accepting a compromised
+// placement outright, per Brian's own explicit framing.
+//
 // T50 (2026-08-26): Brian kept seeing a plain, direct overlap — one element
 // fading in right on top of the other's *current* box — even after T47/T49.
 // Root cause, confirmed against this font's real bundled glyph-width table
@@ -627,7 +646,7 @@ int32_t idleBoxClearance(int16_t ax, int16_t ay, int16_t aHalfW, int16_t aHalfH,
 // WebSerial line below, printed only when a real conflict forced a
 // best-effort (non-ideal) pick — a future capture during a repro would
 // show exactly how often/tight this geometric conflict actually bites.
-void pickIdlePosition(int16_t halfW, int16_t halfH, const IdleElement &self, const IdleElement &other,
+bool pickIdlePosition(int16_t halfW, int16_t halfH, const IdleElement &self, const IdleElement &other,
                        const char *debugLabel, int16_t *outX, int16_t *outY) {
   bool otherFadingOut = other.hasPosition && millis() < other.fadeOutUntilMs;
 
@@ -663,7 +682,7 @@ void pickIdlePosition(int16_t halfW, int16_t halfH, const IdleElement &self, con
     if (satisfiesRepeat && clearance >= IDLE_MIN_ELEMENT_GAP_PX) {
       *outX = cx;
       *outY = cy;
-      return;
+      return true;
     }
 
     // Otherwise, remember this candidate if it's the best seen so far.
@@ -689,7 +708,7 @@ void pickIdlePosition(int16_t halfW, int16_t halfH, const IdleElement &self, con
     }
     *outX = bestX;
     *outY = bestY;
-    return;
+    return false;
   }
 
   // Only reachable if literally nothing sampled fit the circle at all —
@@ -699,6 +718,81 @@ void pickIdlePosition(int16_t halfW, int16_t halfH, const IdleElement &self, con
                     millis(), debugLabel);
   *outX = 0;
   *outY = 0;
+  return false;
+}
+
+// T51 (2026-08-26), Brian's own explicit framing: when a cycle's font
+// choice can't find a fully clear position, "make sure there is nothing in
+// the space it would need to occupy and if so, move to the next option ...
+// if not, then yes, eliminate the [larger font] option" — i.e. don't just
+// accept T50's best-effort compromise at the size that was randomly picked;
+// retry the whole search one font size smaller first, since a smaller box
+// is intrinsically easier to place clear of the other element (see T50's
+// own comment on why — a smaller box's circle-safe region is larger). Only
+// once even the pool's smallest font can't find a clear spot does a
+// best-effort (possibly still slightly overlapping) placement get accepted
+// — the true last resort, not the first move.
+//
+// Picks this cycle's starting font at random same as before, then walks
+// *down* through the pool (IDLE_FONT_POOL is smallest-to-largest, so this
+// walks the array backward from the random start) trying each size in
+// turn. Returns the font actually used; fills *outX/*outY with its position
+// and *outHalfW/*outHalfH with that font's own measured box (so the caller
+// doesn't need to re-measure — this function already did, for whichever
+// font actually won).
+const lv_font_t *pickIdleFontAndPosition(const char *text, const IdleElement &self, const IdleElement &other,
+                                          const char *debugLabel, int16_t *outX, int16_t *outY, int16_t *outHalfW,
+                                          int16_t *outHalfH) {
+  size_t startIndex = random(IDLE_FONT_POOL_COUNT);
+
+  const lv_font_t *fallbackFont = IDLE_FONT_POOL[0];
+  int16_t fallbackX = 0, fallbackY = 0;
+  int16_t fallbackHalfW = 0, fallbackHalfH = 0;
+
+  for (size_t i = startIndex + 1; i-- > 0;) { // counts down from startIndex to 0 inclusive
+    const lv_font_t *font = IDLE_FONT_POOL[i];
+    lv_point_t textSize;
+    // T43: measure the *actual* rendered box for this candidate font+string
+    // (not a hand-picked guess) — see this project's own comment further up
+    // on why 0/0 letter/line-space and the +2px padding match how these
+    // labels actually render.
+    lv_text_get_size(&textSize, text, font, 0, 0, LV_COORD_MAX, LV_TEXT_FLAG_NONE);
+    int16_t halfW = (int16_t)(textSize.x / 2) + 2;
+    int16_t halfH = (int16_t)(textSize.y / 2) + 2;
+
+    int16_t cx, cy;
+    bool perfect = pickIdlePosition(halfW, halfH, self, other, debugLabel, &cx, &cy);
+    if (perfect) {
+      *outX = cx;
+      *outY = cy;
+      *outHalfW = halfW;
+      *outHalfH = halfH;
+      return font;
+    }
+    // Keep the smallest font tried so far as the running fallback — smaller
+    // sizes are intrinsically at least as easy to place as larger ones
+    // already tried, so the last (smallest) one reached below is the best
+    // fallback available.
+    fallbackFont = font;
+    fallbackX = cx;
+    fallbackY = cy;
+    fallbackHalfW = halfW;
+    fallbackHalfH = halfH;
+  }
+
+  // Only reached if not even the pool's smallest font found a fully clear
+  // spot (the loop above always runs at least once, so the fallback* values
+  // are always real by now) — the genuinely-tight case T50 first
+  // identified, now only accepted after every smaller option has already
+  // failed too.
+  WebSerial.printf(
+      "idlePosition: t=%ums element=%s no font size in the pool found a fully clear spot, using smallest-tried\n",
+      millis(), debugLabel);
+  *outX = fallbackX;
+  *outY = fallbackY;
+  *outHalfW = fallbackHalfW;
+  *outHalfH = fallbackHalfH;
+  return fallbackFont;
 }
 
 // Mid-grey, not full white — a slightly muted text color reads more
@@ -829,21 +923,16 @@ void updateIdleElement(IdleElement &el, const IdleElement &other, bool isTime) {
     strcpy(buf, isTime ? "--:--" : "");
   }
   lv_label_set_text(incoming, buf);
-  const lv_font_t *font = IDLE_FONT_POOL[random(IDLE_FONT_POOL_COUNT)];
+
+  // T51: font and position are now chosen together — if the (randomly
+  // started) font size can't find a fully clear spot, this retries the
+  // whole search one size smaller rather than accepting a compromised
+  // placement at the original size. See pickIdleFontAndPosition()'s own
+  // comment.
+  int16_t posX, posY, halfW, halfH;
+  const lv_font_t *font =
+      pickIdleFontAndPosition(buf, el, other, isTime ? "time" : "date", &posX, &posY, &halfW, &halfH);
   lv_obj_set_style_text_font(incoming, font, 0);
-
-  // T43: measure the *actual* rendered box for this cycle's real font+string
-  // (not a hand-picked guess) so pickIdlePosition() can check it against the
-  // panel's real round boundary — the fix for bug #1. No custom letter/line
-  // spacing is set on these labels, so 0/0 here matches how they actually
-  // render; +2px padding on each half-extent covers anti-aliasing overshoot.
-  lv_point_t textSize;
-  lv_text_get_size(&textSize, buf, font, 0, 0, LV_COORD_MAX, LV_TEXT_FLAG_NONE);
-  int16_t halfW = (int16_t)(textSize.x / 2) + 2;
-  int16_t halfH = (int16_t)(textSize.y / 2) + 2;
-
-  int16_t posX, posY;
-  pickIdlePosition(halfW, halfH, el, other, isTime ? "time" : "date", &posX, &posY);
   lv_obj_align(incoming, LV_ALIGN_CENTER, posX, posY);
 
   // T47: stash the box we're vacating *before* overwriting it — its label
