@@ -399,10 +399,24 @@ int32_t utcOffsetMinutes = 0;
 String timeZoneName = "";
 
 // Burn-in-mitigation idle screen (T40, 2026-08-25). Visual treatment redone
-// for T41 (2026-08-25), T42 (2026-08-26), T43 (2026-08-26), and T47
-// (2026-08-26) — each round Brian's own direct feedback after living with
-// the previous one on the physical device. See ECOSYSTEM_PLAN.md's "Burn-in
-// mitigation" section for the original design background.
+// for T41 (2026-08-25), T42 (2026-08-26), T43 (2026-08-26), T47 (2026-08-26),
+// and T49 (2026-08-26) — each round Brian's own direct feedback after living
+// with the previous one on the physical device. See ECOSYSTEM_PLAN.md's
+// "Burn-in mitigation" section for the original design background.
+//
+// T49 fixed the *actual* remaining overlap bug — not a subtle mid-transition
+// timing case (that was T47's fix, and a reasonable first hypothesis, but
+// wrong for this report): `hasPosition` used to start `false` for *both*
+// elements at boot, so whichever one happened to transition first (a coin
+// flip — each element's very first dwell is independently randomized,
+// nothing orders them) saw `other.hasPosition == false` and skipped the
+// overlap check entirely, landing anywhere — including right on top of the
+// other element's still-visible build-time placeholder ("--:--" for time).
+// One element's-worth of bad luck per boot was enough, and this project
+// reboots on every single flash, so it was hitting roughly every other
+// boot. Fixed by seeding both elements with a real, accurate initial box
+// (setIdleElementInitialBox(), called from buildIdleScreen()) instead of
+// leaving hasPosition false until each element's first real transition.
 //
 // T47 fixed the real remaining gap in T43's overlap fix: T43's collision
 // check only ever compared a fresh position against the *other* element's
@@ -626,6 +640,22 @@ lv_obj_t *buildIdleLabel(lv_obj_t *scr, const char *initialText, bool visible) {
   return label;
 }
 
+// T49 (2026-08-26): fills in an IdleElement's box fields for its *initial*
+// build-time placeholder (before it has ever gone through a real
+// pickIdlePosition() transition) — see buildIdleScreen()'s own comment for
+// why this has to be a real, accurate box rather than leaving hasPosition
+// false. Measured the same way updateIdleElement() measures a real cycle's
+// box, for the same font/text actually shown.
+void setIdleElementInitialBox(IdleElement &el, const char *initialText) {
+  lv_point_t sz;
+  lv_text_get_size(&sz, initialText, IDLE_FONT_POOL[0], 0, 0, LV_COORD_MAX, LV_TEXT_FLAG_NONE);
+  el.posX = 0;
+  el.posY = 0;
+  el.halfW = (int16_t)(sz.x / 2) + 2;
+  el.halfH = (int16_t)(sz.y / 2) + 2;
+  el.hasPosition = true;
+}
+
 void buildIdleScreen(lv_obj_t *scr) {
   lv_obj_set_style_bg_color(scr, lv_color_black(), 0);
   lv_obj_set_style_bg_opa(scr, LV_OPA_COVER, 0);
@@ -636,16 +666,31 @@ void buildIdleScreen(lv_obj_t *scr) {
   idleTimeElement.aIsVisible = true;
   idleTimeElement.lastTransitionMs = 0;
   idleTimeElement.dwellMs = (uint32_t)random(IDLE_DWELL_MIN_MS, IDLE_DWELL_MAX_MS + 1);
-  idleTimeElement.hasPosition = false;
   idleTimeElement.fadeOutUntilMs = 0;
+  // T49: root cause of "one element fades in directly on top of the other"
+  // — hasPosition used to start false for *both* elements, so whichever one
+  // transitions first (a coin flip: each element's very first dwell is
+  // independently randomized, nothing orders them) saw `other.hasPosition ==
+  // false` and skipped the overlap check entirely, landing anywhere,
+  // including right on the other element's still-visible build-time
+  // placeholder. Since this only takes one element's-worth of bad luck per
+  // boot, and this project reboots on every single flash, it was hitting
+  // roughly every other boot — not a subtle mid-transition timing edge case
+  // at all, just a plain missing initial value. Fixed by seeding a real,
+  // accurate initial box for both elements right here instead of leaving
+  // hasPosition false until their first real transition.
+  setIdleElementInitialBox(idleTimeElement, "--:--");
 
   idleDateElement.labelA = buildIdleLabel(scr, "", true); // blank (not a fake date) until first real call
   idleDateElement.labelB = buildIdleLabel(scr, "", false);
   idleDateElement.aIsVisible = true;
   idleDateElement.lastTransitionMs = 0;
   idleDateElement.dwellMs = (uint32_t)random(IDLE_DWELL_MIN_MS, IDLE_DWELL_MAX_MS + 1);
-  idleDateElement.hasPosition = false;
   idleDateElement.fadeOutUntilMs = 0;
+  // Blank initial text -> a real but zero-size box (nothing to actually
+  // block against) — same helper, kept symmetric with time's above rather
+  // than special-casing "empty means skip."
+  setIdleElementInitialBox(idleDateElement, "");
 }
 
 // Fills *outTm with this device's current local time (UTC + utcOffsetMinutes,
