@@ -400,9 +400,29 @@ String timeZoneName = "";
 
 // Burn-in-mitigation idle screen (T40, 2026-08-25). Visual treatment redone
 // for T41 (2026-08-25), T42 (2026-08-26), T43 (2026-08-26), T47 (2026-08-26),
-// and T49 (2026-08-26) — each round Brian's own direct feedback after living
-// with the previous one on the physical device. See ECOSYSTEM_PLAN.md's
-// "Burn-in mitigation" section for the original design background.
+// T49 (2026-08-26), and T50 (2026-08-26) — each round Brian's own direct
+// feedback after living with the previous one on the physical device. See
+// ECOSYSTEM_PLAN.md's "Burn-in mitigation" section for the original design
+// background.
+//
+// T50: Brian kept seeing a plain overlap even after T49 — confirmed
+// steady-state, not boot-adjacent (so not a T49 recurrence; that fix
+// structurally holds every boot, verified by grepping for anything else
+// that touches IdleElement state — nothing does). Re-derived the actual
+// mechanism from this font's real bundled glyph-width table rather than
+// guessing further: at 48pt, the date string is wide enough (~300px) that
+// its circle-safe position range shrinks to roughly a 30px radius around
+// the panel's center — small enough that Time's own (much larger) valid
+// region can genuinely leave *zero* circle-safe, non-overlapping candidate
+// for Date to find in `IDLE_POSITION_ATTEMPTS` tries. T43/T47's old 3-tier
+// scheme handled that failure badly — its last tier accepted the first
+// circle-safe random point with *no* regard for the other element,
+// including landing exactly on top of it. Replaced with a best-effort
+// search (pickIdlePosition() below) that scores every sampled candidate by
+// actual clearance from the other element and keeps the best one, instead
+// of an unconstrained one, when no perfect candidate exists — see that
+// function's own comment for the full reasoning and idleBoxClearance() for
+// the scoring itself.
 //
 // T49 fixed the *actual* remaining overlap bug — not a subtle mid-transition
 // timing case (that was T47's fix, and a reasonable first hypothesis, but
@@ -523,7 +543,10 @@ constexpr int16_t IDLE_PANEL_RADIUS = 195; // 2.04" round 390x390 panel (HARDWAR
 constexpr int16_t IDLE_SAFE_RADIUS = 185;  // small inward margin from the true bezel edge
 constexpr int16_t IDLE_MIN_REPEAT_DISTANCE_PX = 50; // must move at least this far from its own last spot (bug #3)
 constexpr int16_t IDLE_MIN_ELEMENT_GAP_PX = 10;     // required clear gap between the two elements' boxes (bug #2)
-constexpr int IDLE_POSITION_ATTEMPTS_PER_TIER = 40; // random tries before pickIdlePosition() relaxes a constraint
+// T50: single sample budget for pickIdlePosition()'s best-effort search
+// (replaced the old fixed 3-tier x 40-attempt scheme) — see that function's
+// own comment for why.
+constexpr int IDLE_POSITION_ATTEMPTS = 60;
 // Randomized per-cycle rather than a flat interval — each element re-rolls
 // its own dwell independently every transition, which is what actually keeps
 // date and time drifting out of phase with each other rather than sharing
@@ -557,73 +580,123 @@ bool idleBoxFitsCircle(int16_t cx, int16_t cy, int16_t halfW, int16_t halfH, int
   return true;
 }
 
-// Plain axis-aligned-bounding-box overlap test, padded by a required clear
-// gap — used to keep the two elements' boxes apart (bug #2).
-bool idleBoxesTooClose(int16_t ax, int16_t ay, int16_t aHalfW, int16_t aHalfH,
-                        int16_t bx, int16_t by, int16_t bHalfW, int16_t bHalfH, int16_t gap) {
-  bool separatedX = (ax + aHalfW + gap < bx - bHalfW) || (bx + bHalfW + gap < ax - aHalfW);
-  bool separatedY = (ay + aHalfH + gap < by - bHalfH) || (by + bHalfH + gap < ay - aHalfH);
-  return !(separatedX || separatedY);
+// Signed clearance between two boxes: positive = genuinely separated by
+// this many px (the real gap on whichever axis is doing the separating);
+// negative = overlapping, magnitude = the shallower (smaller) of the two
+// axes' penetration depth — i.e. how far the box would need to move to
+// just barely stop overlapping. Replaces T43/T47's boolean
+// idleBoxesTooClose() — T50 needs an actual *measure* of how bad a
+// candidate is, not just pass/fail, to rank fallback candidates (see
+// pickIdlePosition()).
+int32_t idleBoxClearance(int16_t ax, int16_t ay, int16_t aHalfW, int16_t aHalfH, int16_t bx, int16_t by,
+                          int16_t bHalfW, int16_t bHalfH) {
+  int32_t xGap = (int32_t)max(ax - aHalfW, bx - bHalfW) - (int32_t)min(ax + aHalfW, bx + bHalfW);
+  int32_t yGap = (int32_t)max(ay - aHalfH, by - bHalfH) - (int32_t)min(ay + aHalfH, by + bHalfH);
+  return xGap > yGap ? xGap : yGap;
 }
 
-// Rejection-samples a position for a box of the given half-extents (the
-// *actual* measured size of this cycle's font+string, from
-// lv_text_get_size() at the call site). Three tiers, each strictly more
-// permissive than the last, tried in order — circle-fit is never relaxed
-// (clipping off the visible panel is bug #1, the one actually being fixed
-// here); avoid-repeat (bug #3) and avoid-the-other-element (bug #2) are
-// best-effort and only dropped if no valid spot can be found while honoring
-// them, so a genuinely crowded case degrades to "may repeat" or "may
-// overlap" rather than "may clip." `debugLabel` ("time"/"date") is only used
-// for the WebSerial lines below, so a future capture of a real overlap
-// report can show whether it came from tier-relaxation (crowding) — see
-// this function's T47 update for the other, now-fixed mechanism.
+// T50 (2026-08-26): Brian kept seeing a plain, direct overlap — one element
+// fading in right on top of the other's *current* box — even after T47/T49.
+// Root cause, confirmed against this font's real bundled glyph-width table
+// (not a guess): at 48pt, the date string ("Wed Aug 26") measures roughly
+// 300px wide. For a box that size to pass idleBoxFitsCircle() against
+// IDLE_SAFE_RADIUS (185px), its center has to land within roughly a 30px
+// radius of the panel's own center — a *small* valid region. Time's own
+// valid region at the same font size is much larger (its string is
+// shorter), and often sits centrally too. When both land near center at
+// once, all `IDLE_POSITION_ATTEMPTS` tries can genuinely fail to find any
+// spot that's both circle-safe *and* clear of the other element — a real,
+// not rare, geometric conflict, not just occasional bad luck.
+//
+// T43/T47's old fix (3 tiers, each dropping a constraint, falling through
+// to "accept the first fit-only random point") handled that failure badly:
+// tier 2 would accept *any* circle-safe point with zero regard for how
+// close it was to the other element — including landing exactly on top of
+// it, which is exactly what Brian saw. Replaced with a single best-effort
+// search: every circle-fitting candidate sampled is scored by
+// idleBoxClearance() against the other element's box (and its still-fading
+// -out previous box, if any — see IdleElement's own comment), and the
+// *best-scoring* one found is used if no perfect (repeat-safe and
+// gap-clear) candidate turns up. This can't fully eliminate overlap in the
+// genuinely-tight case above (there may be no candidate with real
+// clearance at all), but it guarantees the *least bad* option found is
+// used, never an arbitrary/unconstrained one — this project's floor is now
+// "may still overlap a little in a tight case," not "may land exactly on
+// top." circle-fit itself is still never relaxed (bug #1 stays fixed
+// unconditionally). `debugLabel` ("time"/"date") is only used for the
+// WebSerial line below, printed only when a real conflict forced a
+// best-effort (non-ideal) pick — a future capture during a repro would
+// show exactly how often/tight this geometric conflict actually bites.
 void pickIdlePosition(int16_t halfW, int16_t halfH, const IdleElement &self, const IdleElement &other,
                        const char *debugLabel, int16_t *outX, int16_t *outY) {
-  // T47: `other`'s previous box is still visibly fading out (idleFadeAnimCb)
-  // for a while after other.posX/posY has already moved on — see
-  // IdleElement's own comment on prevPosX/fadeOutUntilMs. Checked as a
-  // second, separate box alongside other's current one whenever it's still
-  // within its fade window.
   bool otherFadingOut = other.hasPosition && millis() < other.fadeOutUntilMs;
 
-  for (int tier = 0; tier < 3; tier++) {
-    bool requireRepeatDistance = (tier == 0);
-    bool requireGap = (tier <= 1);
-    for (int attempt = 0; attempt < IDLE_POSITION_ATTEMPTS_PER_TIER; attempt++) {
-      int16_t cx = (int16_t)random(-IDLE_SAFE_RADIUS, IDLE_SAFE_RADIUS + 1);
-      int16_t cy = (int16_t)random(-IDLE_SAFE_RADIUS, IDLE_SAFE_RADIUS + 1);
-      if (!idleBoxFitsCircle(cx, cy, halfW, halfH, IDLE_SAFE_RADIUS)) continue;
-      if (requireRepeatDistance && self.hasPosition) {
-        int32_t dx = cx - self.posX, dy = cy - self.posY;
-        if (dx * dx + dy * dy < (int32_t)IDLE_MIN_REPEAT_DISTANCE_PX * IDLE_MIN_REPEAT_DISTANCE_PX) continue;
+  int16_t bestX = 0, bestY = 0;
+  int32_t bestClearance = INT32_MIN;
+  bool bestSatisfiesRepeat = false;
+  bool haveCandidate = false;
+
+  for (int attempt = 0; attempt < IDLE_POSITION_ATTEMPTS; attempt++) {
+    int16_t cx = (int16_t)random(-IDLE_SAFE_RADIUS, IDLE_SAFE_RADIUS + 1);
+    int16_t cy = (int16_t)random(-IDLE_SAFE_RADIUS, IDLE_SAFE_RADIUS + 1);
+    if (!idleBoxFitsCircle(cx, cy, halfW, halfH, IDLE_SAFE_RADIUS)) continue; // hard constraint, never relaxed
+
+    bool satisfiesRepeat = !self.hasPosition;
+    if (self.hasPosition) {
+      int32_t dx = cx - self.posX, dy = cy - self.posY;
+      satisfiesRepeat = dx * dx + dy * dy >= (int32_t)IDLE_MIN_REPEAT_DISTANCE_PX * IDLE_MIN_REPEAT_DISTANCE_PX;
+    }
+
+    int32_t clearance = INT32_MAX; // nothing to conflict with yet (shouldn't happen post-T49, but stay safe)
+    if (other.hasPosition) {
+      clearance = idleBoxClearance(cx, cy, halfW, halfH, other.posX, other.posY, other.halfW, other.halfH);
+      if (otherFadingOut) {
+        int32_t clearancePrev = idleBoxClearance(cx, cy, halfW, halfH, other.prevPosX, other.prevPosY,
+                                                  other.prevHalfW, other.prevHalfH);
+        clearance = clearance < clearancePrev ? clearance : clearancePrev; // must clear *both* boxes other may show
       }
-      if (requireGap && other.hasPosition) {
-        if (idleBoxesTooClose(cx, cy, halfW, halfH, other.posX, other.posY, other.halfW, other.halfH,
-                               IDLE_MIN_ELEMENT_GAP_PX))
-          continue;
-        if (otherFadingOut && idleBoxesTooClose(cx, cy, halfW, halfH, other.prevPosX, other.prevPosY,
-                                                 other.prevHalfW, other.prevHalfH, IDLE_MIN_ELEMENT_GAP_PX))
-          continue;
-      }
-      if (tier > 0) {
-        // T47 debug: only fires when the no-repeat and/or no-overlap
-        // constraint actually had to be dropped to find a fit — confirms
-        // whether real crowding (not just the now-fixed stale-fade-out-box
-        // gap) is a live contributor if overlap reports ever recur.
-        WebSerial.printf("idlePosition: t=%ums element=%s relaxed to tier=%d\n", millis(), debugLabel, tier);
-      }
+    }
+
+    // Perfect candidate — clears the real gap requirement against `other`
+    // and doesn't repeat `self`'s own last spot. Take it immediately, no
+    // need to keep sampling.
+    if (satisfiesRepeat && clearance >= IDLE_MIN_ELEMENT_GAP_PX) {
       *outX = cx;
       *outY = cy;
       return;
     }
+
+    // Otherwise, remember this candidate if it's the best seen so far.
+    // Clearance from the other element is the primary sort key (landing on
+    // top of *different* text is the actually-illegible failure Brian
+    // reported); the repeat-distance miss is only a tie-breaker (re-landing
+    // near this same element's own last spot is a duller failure).
+    bool better = !haveCandidate || clearance > bestClearance ||
+                  (clearance == bestClearance && satisfiesRepeat && !bestSatisfiesRepeat);
+    if (better) {
+      bestX = cx;
+      bestY = cy;
+      bestClearance = clearance;
+      bestSatisfiesRepeat = satisfiesRepeat;
+      haveCandidate = true;
+    }
   }
-  // Last resort: dead center. Always the easiest spot to fit inside the
-  // circle for any font/string this project's IDLE_FONT_POOL produces, so
-  // this only actually triggers if the panel is fully crowded out — an
-  // accepted rare degrade (possible repeat/overlap) over an unbounded
-  // search.
-  WebSerial.printf("idlePosition: t=%ums element=%s exhausted all tiers, using center fallback\n", millis(), debugLabel);
+
+  if (haveCandidate) {
+    if (bestClearance < IDLE_MIN_ELEMENT_GAP_PX) {
+      WebSerial.printf("idlePosition: t=%ums element=%s best-effort clearance=%dpx (wanted >=%dpx)\n", millis(),
+                        debugLabel, (int)bestClearance, IDLE_MIN_ELEMENT_GAP_PX);
+    }
+    *outX = bestX;
+    *outY = bestY;
+    return;
+  }
+
+  // Only reachable if literally nothing sampled fit the circle at all —
+  // shouldn't happen for any font/string this project's IDLE_FONT_POOL
+  // produces, but a safe last resort regardless.
+  WebSerial.printf("idlePosition: t=%ums element=%s found nothing that fits the circle, using center fallback\n",
+                    millis(), debugLabel);
   *outX = 0;
   *outY = 0;
 }
