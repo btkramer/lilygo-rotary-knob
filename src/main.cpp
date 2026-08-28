@@ -179,6 +179,137 @@ uint32_t lastSeenSecondsAgo = 0;
 // treatment was suppressed while testing (Brian, 2026-08-19).
 constexpr bool PC_OFFLINE_DIM_ENABLED = true;
 
+// Agent-monitor mode (T60, 2026-08-28) — knob-side glanceable per-session
+// status indicator for Claude Code (and later other agent-tool) sessions,
+// fed by pc-dash-hub's new agent-session endpoints (T57/T58, both live and
+// live-verified 2026-08-28). See ECOSYSTEM_PLAN.md's "Agent-monitor mode"
+// section and the pc-dash coordinator's TASKS.md T56/T57/T60 rows for the
+// full cross-project design. v1 is notify-only, per that design: a status
+// badge (pulse-ring pattern, same technique as speakerMuteRingPulse) on
+// Home, plus buzz+flash on transitioning into a state that needs a human.
+// No approve/deny/interrupt control yet.
+enum AgentStatus {
+  AGENT_STATUS_NONE = 0, // no active sessions (or hub unreachable / feature not live) — badge stays hidden
+  AGENT_STATUS_IDLE,
+  AGENT_STATUS_WORKING,
+  AGENT_STATUS_DONE,
+  AGENT_STATUS_ERROR,
+  AGENT_STATUS_NEEDS_INPUT,
+};
+
+// The knob shows one badge, not a grid (that's the phone's job, T59) — many
+// concurrent sessions collapse to whichever one most needs attention.
+// needs-input outranks error: it's the state that specifically can't
+// proceed without a human right now, which is this whole feature's reason
+// to exist, whereas error (something broke) is bad but not necessarily
+// blocked on YOU specifically. v1 heuristic, easy to reorder later if living
+// with it says otherwise.
+int agentStatusPriority(AgentStatus s) {
+  switch (s) {
+    case AGENT_STATUS_NEEDS_INPUT: return 5;
+    case AGENT_STATUS_ERROR:       return 4;
+    case AGENT_STATUS_WORKING:     return 3;
+    case AGENT_STATUS_IDLE:        return 2;
+    case AGENT_STATUS_DONE:        return 1;
+    default:                       return 0;
+  }
+}
+
+lv_color_t agentStatusColor(AgentStatus s) {
+  switch (s) {
+    // Amber/red match the Codex-Micro-style vocabulary this feature's design
+    // was synthesized from (ECOSYSTEM_PLAN.md); blue/green reuse this
+    // project's own existing ring-gauge colors (gpuArc/ramArc) rather than
+    // inventing a third palette.
+    case AGENT_STATUS_NEEDS_INPUT: return lv_color_hex(0xFFB300); // amber — needs you
+    case AGENT_STATUS_ERROR:       return lv_color_hex(0xFF3B30); // red — something broke
+    case AGENT_STATUS_WORKING:     return lv_color_hex(0x00C853); // green — active, fine
+    case AGENT_STATUS_IDLE:        return lv_color_hex(0x0080FF); // blue — calm
+    case AGENT_STATUS_DONE:        return lv_color_hex(0x555555); // dim gray
+    default:                       return lv_color_hex(0x333333);
+  }
+}
+
+AgentStatus agentStatusFromString(const char *s) {
+  if (!s) return AGENT_STATUS_NONE;
+  if (!strcmp(s, "idle")) return AGENT_STATUS_IDLE;
+  if (!strcmp(s, "working")) return AGENT_STATUS_WORKING;
+  if (!strcmp(s, "needs-input")) return AGENT_STATUS_NEEDS_INPUT;
+  if (!strcmp(s, "error")) return AGENT_STATUS_ERROR;
+  if (!strcmp(s, "done")) return AGENT_STATUS_DONE;
+  return AGENT_STATUS_NONE; // unrecognized status string — treat like "no session", not a crash
+}
+
+// Aggregate across all tracked sessions, applied by loop() from the synced
+// poll result — see pollAgentSessions()/pollSyncState() further down.
+AgentStatus agentAggregateStatus = AGENT_STATUS_NONE;
+int agentAttentionCount = 0; // sessions currently needs-input or error
+
+// Buzzer (T60) — plain tone()/noTone() on PIN_BUZZER (17, confirmed in
+// pin_config.h). HARDWARE.md also notes a vibration motor on this board,
+// "unused so far" — deliberately NOT wired here too: its GPIO isn't
+// documented anywhere this project has confirmed on real hardware (only the
+// buzzer pin made it into pin_config.h), and this project's own hard-won
+// rule is not to guess hardware pins (see arduino/CLAUDE.md's ACL saga for
+// an unrelated example of the same "verify, don't guess" norm). Flagged as
+// an open question in coordinator-reports/pc-dash.md rather than guessed.
+//
+// Non-blocking: loop() must never block (ArduinoOTA.handle() only gets
+// serviced when loop() reaches it — see the sync section's own comment on
+// why that matters). serviceBuzzer(), called every loop() pass, steps
+// through a short on/off pattern purely by comparing millis() against a
+// deadline — same "never delay(), always millis()-gated" shape as every
+// other timed effect in this file (e.g. showVolumeOverlay's fuse).
+struct BuzzStep { uint16_t freqHz; uint16_t onMs; uint16_t offMs; };
+// Two short high beeps vs. three lower ones — distinct enough by ear to
+// tell "needs your input" from "something errored" without looking, per
+// ECOSYSTEM_PLAN.md's "distinct patterns per notification tier" ask.
+constexpr BuzzStep BUZZ_PATTERN_NEEDS_INPUT[] = {{2200, 120, 90}, {2200, 120, 90}};
+constexpr BuzzStep BUZZ_PATTERN_ERROR[] = {{1100, 160, 110}, {1100, 160, 110}, {1100, 160, 110}};
+const BuzzStep *buzzPattern = nullptr;
+size_t buzzPatternLen = 0;
+size_t buzzStepIndex = 0;
+uint32_t buzzStepUntilMs = 0;
+bool buzzPlaying = false;
+bool buzzInOnPhase = false;
+// Settings-synced (see pollSyncState()'s settings parsing) — defaults on
+// until a real value has synced. Field name (`buzzerEnabled`) is this
+// firmware's own guess at the wire shape pc-dash-hub already reserved for
+// it (see pollSyncState()'s pre-existing comment predating this feature);
+// flagged to the coordinator for pc-dash-hub to confirm/correct, same
+// coordinate-first pattern as T57/T58's own wire-shape questions.
+bool buzzerEnabled = true;
+
+void startBuzzPattern(const BuzzStep *pattern, size_t len) {
+  if (!buzzerEnabled || len == 0) return;
+  buzzPattern = pattern;
+  buzzPatternLen = len;
+  buzzStepIndex = 0;
+  buzzPlaying = true;
+  buzzInOnPhase = true;
+  tone(PIN_BUZZER, buzzPattern[0].freqHz);
+  buzzStepUntilMs = millis() + buzzPattern[0].onMs;
+}
+
+void serviceBuzzer() {
+  if (!buzzPlaying) return;
+  if (millis() < buzzStepUntilMs) return;
+  if (buzzInOnPhase) {
+    noTone(PIN_BUZZER);
+    buzzInOnPhase = false;
+    buzzStepUntilMs = millis() + buzzPattern[buzzStepIndex].offMs;
+  } else {
+    buzzStepIndex++;
+    if (buzzStepIndex >= buzzPatternLen) {
+      buzzPlaying = false;
+      return;
+    }
+    buzzInOnPhase = true;
+    tone(PIN_BUZZER, buzzPattern[buzzStepIndex].freqHz);
+    buzzStepUntilMs = millis() + buzzPattern[buzzStepIndex].onMs;
+  }
+}
+
 // LVGL owns its own draw buffer and rendering entirely — this replaces the
 // earlier direct-to-Arduino_GFX drawHomeScreen()/drawRingGauge() approach.
 // Two full-frame PSRAM buffers (LV_DISPLAY_RENDER_MODE_FULL), not a small
@@ -203,6 +334,8 @@ lv_color_t *lvDrawBuf2 = nullptr;
 lv_obj_t *cpuArc, *gpuArc, *ramArc;
 lv_obj_t *cpuLabel, *gpuLabel, *ramLabel;
 lv_obj_t *homeOfflineLabel;
+lv_obj_t *agentStatusBadge;  // T60 — pulse-ring pattern, see its own build-site comment
+lv_obj_t *agentFlashOverlay; // T60 — one-shot full-panel tint on entering an attention state
 
 uint32_t lvMillisCb() { return millis(); }
 
@@ -353,6 +486,72 @@ void updateHomeScreen() {
   }
 }
 
+// T60: pulse anim callback for agentStatusBadge — same technique as
+// speakerMutePulseAnimCb (animate a plain lv_obj's border opacity, never an
+// lv_arc — see speakerMuteRingPulse's own comment for why lv_arc is unsafe
+// here for anything redrawn repeatedly).
+void agentBadgePulseAnimCb(void *obj, int32_t value) {
+  lv_obj_set_style_border_opa((lv_obj_t *)obj, (lv_opa_t)value, 0);
+}
+
+// Reflects agentAggregateStatus on Home's badge: hidden when there's
+// nothing to show (AGENT_STATUS_NONE), a steady-lit ring for calm states
+// (idle/working/done), an infinite pulse — faster than Speaker Mute's 900ms,
+// deliberately more insistent — for the two states that actually need a
+// human (needs-input/error). Called whenever agentAggregateStatus changes
+// (loop()'s sync-apply step) — cheap to call redundantly (just restarts the
+// same anim), but callers only do so on an actual change, matching this
+// file's general "only touch LVGL on real change" convention.
+void updateAgentStatusBadge() {
+  lv_anim_delete(agentStatusBadge, agentBadgePulseAnimCb);
+  if (agentAggregateStatus == AGENT_STATUS_NONE) {
+    lv_obj_add_flag(agentStatusBadge, LV_OBJ_FLAG_HIDDEN);
+    return;
+  }
+  lv_obj_remove_flag(agentStatusBadge, LV_OBJ_FLAG_HIDDEN);
+  lv_obj_set_style_border_color(agentStatusBadge, agentStatusColor(agentAggregateStatus), 0);
+  bool attention = (agentAggregateStatus == AGENT_STATUS_NEEDS_INPUT || agentAggregateStatus == AGENT_STATUS_ERROR);
+  if (attention) {
+    lv_anim_t a;
+    lv_anim_init(&a);
+    lv_anim_set_var(&a, agentStatusBadge);
+    lv_anim_set_exec_cb(&a, agentBadgePulseAnimCb);
+    lv_anim_set_values(&a, LV_OPA_30, LV_OPA_COVER);
+    lv_anim_set_time(&a, 500);
+    lv_anim_set_playback_time(&a, 500); // fade back down, not a hard cut — same shape as speakerMuteRingPulse
+    lv_anim_set_repeat_count(&a, LV_ANIM_REPEAT_INFINITE);
+    lv_anim_set_path_cb(&a, lv_anim_path_ease_in_out);
+    lv_anim_start(&a);
+  } else {
+    lv_obj_set_style_border_opa(agentStatusBadge, LV_OPA_COVER, 0);
+  }
+}
+
+// T60: one-shot full-panel tint, fired only on transitioning INTO an
+// attention state (loop()'s sync-apply step) — the "flash" of "buzz/flash/
+// pulse on state changes". A translucent tint, not LV_OPA_COVER, so the
+// CPU/GPU/RAM readout stays legible through it rather than being fully
+// blanked. Round (LV_RADIUS_CIRCLE), matching the physical round panel —
+// square corners would show where the display can't actually render.
+void agentFlashAnimCb(void *obj, int32_t value) {
+  lv_obj_set_style_bg_opa((lv_obj_t *)obj, (lv_opa_t)value, 0);
+}
+
+void triggerAgentFlash(lv_color_t color) {
+  lv_obj_set_style_bg_color(agentFlashOverlay, color, 0);
+  lv_anim_delete(agentFlashOverlay, agentFlashAnimCb);
+  lv_anim_t a;
+  lv_anim_init(&a);
+  lv_anim_set_var(&a, agentFlashOverlay);
+  lv_anim_set_exec_cb(&a, agentFlashAnimCb);
+  lv_anim_set_values(&a, 0, LV_OPA_60);
+  lv_anim_set_time(&a, 220);
+  lv_anim_set_playback_time(&a, 380);
+  lv_anim_set_repeat_count(&a, 1); // one-shot, not a loop — agentStatusBadge's own pulse is the ongoing indicator
+  lv_anim_set_path_cb(&a, lv_anim_path_ease_out);
+  lv_anim_start(&a);
+}
+
 void buildHomeScreen(lv_obj_t *scr) {
   lv_obj_set_style_bg_color(scr, lv_color_black(), 0);
   lv_obj_set_style_bg_opa(scr, LV_OPA_COVER, 0);
@@ -375,7 +574,39 @@ void buildHomeScreen(lv_obj_t *scr) {
   lv_obj_align(homeOfflineLabel, LV_ALIGN_BOTTOM_MID, 0, -20);
   lv_obj_add_flag(homeOfflineLabel, LV_OBJ_FLAG_HIDDEN); // shown by updateHomeScreen() once pcConnected is known
 
+  // T60: agentStatusBadge sits at y=-90 — inside ramArc's inner radius
+  // (115px), above the CPU/GPU/RAM label stack (which spans roughly y=-61
+  // to 61 at font 28), clear of all three ring gauges and their ~5-10px
+  // gaps. Not placed outside the rings (the gap between cpuArc's outer edge
+  // and the panel bezel is only ~10px, too tight for a real badge) or on
+  // idleScreen (T40-T51 fought hard to keep that screen free of any static
+  // element for burn-in reasons — this stays Home-only, deliberately).
+  agentStatusBadge = lv_obj_create(scr);
+  lv_obj_remove_flag(agentStatusBadge, LV_OBJ_FLAG_SCROLLABLE);
+  lv_obj_remove_flag(agentStatusBadge, LV_OBJ_FLAG_CLICKABLE);
+  lv_obj_set_size(agentStatusBadge, 34, 34);
+  lv_obj_align(agentStatusBadge, LV_ALIGN_CENTER, 0, -90);
+  lv_obj_set_style_radius(agentStatusBadge, LV_RADIUS_CIRCLE, 0);
+  lv_obj_set_style_bg_opa(agentStatusBadge, LV_OPA_TRANSP, 0); // ring only, no fill — same shape as speakerMuteRingPulse
+  lv_obj_set_style_border_width(agentStatusBadge, 7, 0);
+  lv_obj_set_style_pad_all(agentStatusBadge, 0, 0);
+  lv_obj_add_flag(agentStatusBadge, LV_OBJ_FLAG_HIDDEN); // shown by updateAgentStatusBadge() once there's real data
+
+  agentFlashOverlay = lv_obj_create(scr);
+  lv_obj_remove_flag(agentFlashOverlay, LV_OBJ_FLAG_SCROLLABLE);
+  lv_obj_remove_flag(agentFlashOverlay, LV_OBJ_FLAG_CLICKABLE);
+  lv_obj_set_size(agentFlashOverlay, SCREEN_WIDTH, SCREEN_HEIGHT);
+  lv_obj_center(agentFlashOverlay);
+  lv_obj_set_style_radius(agentFlashOverlay, LV_RADIUS_CIRCLE, 0);
+  lv_obj_set_style_border_width(agentFlashOverlay, 0, 0);
+  lv_obj_set_style_bg_opa(agentFlashOverlay, LV_OPA_TRANSP, 0); // fully transparent at rest; triggerAgentFlash() animates this
+  lv_obj_set_style_pad_all(agentFlashOverlay, 0, 0);
+  // Created last among Home's children — LVGL draws later-added siblings on
+  // top, so this sits above the rings/labels/badge without needing an
+  // explicit z-order call.
+
   updateHomeScreen();
+  updateAgentStatusBadge();
 }
 
 // T44 (2026-08-26): the idle screen's clock's authoritative local-time
@@ -2298,6 +2529,15 @@ struct SyncResult {
   String nowPlayingSource;
   uint32_t nowPlayingPositionMs;
   uint32_t nowPlayingDurationMs;
+  // T60 (agent-monitor mode) — see pollAgentSessions()'s own comment for how
+  // these are derived, and buzzerEnabled's declaration for the settings
+  // field this rides in on. Both "preserved unless a real value arrives"
+  // (same pattern as volumeFuseMs etc.) since agent-sessions is polled on
+  // its own slower cadence, not every pcState poll — see
+  // AGENT_SESSIONS_POLL_INTERVAL_MS.
+  AgentStatus agentAggregateStatus;
+  int agentAttentionCount;
+  bool buzzerEnabled;
 };
 SyncResult pendingSyncResult;
 
@@ -2319,6 +2559,66 @@ bool syncGet(const char *host, String &body) {
   body = http.getString();
   http.end();
   return true;
+}
+
+// T60 (agent-monitor mode) — separate endpoint (GET /api/agent-sessions,
+// T57) from the per-device settings+pcState blob above, polled on its own
+// slower cadence (AGENT_SESSIONS_POLL_INTERVAL_MS) rather than doubling
+// every 1s pcState poll's network cost: a human noticing/acting on "needs
+// your input" doesn't need sub-second freshness the way Now Playing's
+// position did (T25/T29). Only ever called from syncPollTask.
+constexpr uint32_t AGENT_SESSIONS_POLL_INTERVAL_MS = 3000;
+uint32_t lastAgentSessionsPollMs = 0;
+
+bool agentSessionsGet(const char *host, String &body) {
+  HTTPClient http;
+  String url = String("http://") + host + ":" + SYNC_PORT + "/api/agent-sessions";
+  http.begin(url);
+  http.setConnectTimeout(SYNC_HTTP_TIMEOUT_MS);
+  http.setTimeout(SYNC_HTTP_TIMEOUT_MS);
+  int httpCode = http.GET();
+  if (httpCode != HTTP_CODE_OK) {
+    Serial.printf("agentSessions: GET %s failed, code=%d\n", host, httpCode);
+    http.end();
+    return false;
+  }
+  body = http.getString();
+  http.end();
+  return true;
+}
+
+// Fetch + aggregate the session list into one glanceable status (see
+// agentStatusPriority()'s own comment for the aggregation rule) — only ever
+// touches `result`, same "stage for loop() to apply, never touch LVGL/real
+// globals here" discipline as pollSyncState() itself. Leaves result's
+// agent* fields at whatever pollSyncState() seeded them with (the current
+// global values) on any failure, so a transient miss doesn't blank the
+// badge — same "preserved unless real value" shape as volumeFuseMs etc.
+void pollAgentSessions(SyncResult &result) {
+  String body;
+  if (!agentSessionsGet(SYNC_HOST, body) && !agentSessionsGet(SYNC_FALLBACK_IP, body)) {
+    return;
+  }
+  JsonDocument doc;
+  DeserializationError err = deserializeJson(doc, body);
+  if (err) {
+    Serial.printf("agentSessions: JSON parse failed: %s\n", err.c_str());
+    return;
+  }
+  JsonArray sessions = doc.as<JsonArray>(); // response body is a bare array, confirmed via T61's smoke test (200 [])
+  AgentStatus worst = AGENT_STATUS_NONE;
+  int attentionCount = 0;
+  int activeCount = 0;
+  for (JsonObject s : sessions) {
+    if (s["stale"] | false) continue; // hub-side safety net for a hard-killed process (T57) — not actionable
+    AgentStatus st = agentStatusFromString(s["status"] | "");
+    if (st == AGENT_STATUS_DONE || st == AGENT_STATUS_NONE) continue; // finished/unrecognized sessions don't need attention
+    activeCount++;
+    if (st == AGENT_STATUS_NEEDS_INPUT || st == AGENT_STATUS_ERROR) attentionCount++;
+    if (agentStatusPriority(st) > agentStatusPriority(worst)) worst = st;
+  }
+  result.agentAggregateStatus = (activeCount > 0) ? worst : AGENT_STATUS_NONE;
+  result.agentAttentionCount = attentionCount;
 }
 
 // T48 (2026-08-26): utcOffsetMinutes now free-runs between syncs instead of
@@ -2371,6 +2671,14 @@ bool pollSyncState() {
   result.nowPlayingDurationMs = 0;
   result.timeZoneName = ""; // cosmetic-only, safe to blip empty on a transient parse — unlike utcOffsetMinutes, not preserved
   result.ok = false;
+  // T60: preserved-unless-a-real-value-arrives, same pattern as
+  // volumeFuseMs/idleToHomeMs/etc above — agentAggregateStatus/
+  // agentAttentionCount are only ever overwritten by pollAgentSessions() on
+  // its own slower cadence (see AGENT_SESSIONS_POLL_INTERVAL_MS), and
+  // buzzerEnabled only when the settings blob below actually has it.
+  result.agentAggregateStatus = agentAggregateStatus;
+  result.agentAttentionCount = agentAttentionCount;
+  result.buzzerEnabled = buzzerEnabled;
 
   if (WiFi.status() == WL_CONNECTED) {
     String body;
@@ -2398,6 +2706,15 @@ bool pollSyncState() {
           if (result.idleToHomeMs != idleToHomeMs) syncPrefs.putUInt("idleMs", result.idleToHomeMs);
           if (result.dimDelayMs != dimDelayMs) syncPrefs.putUInt("dimDelayMs", result.dimDelayMs);
         }
+        // T60: first field read out of `settings` directly rather than
+        // through `timeouts` — buzzerEnabled isn't a timeout. Field name is
+        // this firmware's own guess at the wire shape pc-dash-hub already
+        // reserved for it (see this function's pre-T60 comment, right
+        // above, predating this feature); flagged to the coordinator for
+        // pc-dash-hub to confirm/correct, same as T57/T58's own
+        // coordinate-first wire-shape questions.
+        result.buzzerEnabled = doc["settings"]["buzzerEnabled"] | buzzerEnabled;
+        if (result.buzzerEnabled != buzzerEnabled) syncPrefs.putBool("buzzerEn", result.buzzerEnabled);
         // pc-dash-app (step 4) is live now (2026-08-20) — pcState carries
         // real volume/mute/now-playing values, reconciled against the local
         // knob-driven estimate in loop() once pcConnected is true (T14,
@@ -2444,6 +2761,13 @@ bool pollSyncState() {
         result.ok = true;
       }
     }
+    // T60: independent of whether the pcState GET above succeeded — a
+    // separate endpoint/request, gated on its own slower cadence rather
+    // than every 1s pass (see AGENT_SESSIONS_POLL_INTERVAL_MS's comment).
+    if (millis() - lastAgentSessionsPollMs >= AGENT_SESSIONS_POLL_INTERVAL_MS) {
+      lastAgentSessionsPollMs = millis();
+      pollAgentSessions(result);
+    }
   }
 
   xSemaphoreTake(syncResultMutex, portMAX_DELAY);
@@ -2486,8 +2810,9 @@ void setupSyncSettings() {
   idleToHomeMs = syncPrefs.getUInt("idleMs", IDLE_TO_HOME_MS_DEFAULT);
   dimDelayMs = syncPrefs.getUInt("dimDelayMs", DIM_DELAY_MS_DEFAULT);
   utcOffsetMinutes = syncPrefs.getInt("utcOffMin", 0); // T44 — 0 (plain UTC) until a real value has ever synced
-  Serial.printf("sync: loaded from NVS: volumeFuseMs=%u idleToHomeMs=%u dimDelayMs=%u utcOffsetMinutes=%d\n",
-                volumeFuseMs, idleToHomeMs, dimDelayMs, utcOffsetMinutes);
+  buzzerEnabled = syncPrefs.getBool("buzzerEn", true); // T60 — on by default until a real value has ever synced
+  Serial.printf("sync: loaded from NVS: volumeFuseMs=%u idleToHomeMs=%u dimDelayMs=%u utcOffsetMinutes=%d buzzerEnabled=%d\n",
+                volumeFuseMs, idleToHomeMs, dimDelayMs, utcOffsetMinutes, buzzerEnabled);
 
   syncResultMutex = xSemaphoreCreateMutex();
   xTaskCreatePinnedToCore(syncPollTask, "syncPoll", 8192, NULL, 1, NULL, 0);
@@ -2738,6 +3063,7 @@ void setup() {
   pinMode(PIN_ENCODER_B, INPUT_PULLUP);
   pinMode(PIN_ENCODER_KEY, INPUT_PULLUP);
   attachInterrupt(digitalPinToInterrupt(PIN_ENCODER_A), encoderIsr, CHANGE);
+  pinMode(PIN_BUZZER, OUTPUT); // T60 — tone()/noTone() drive this via LEDC; explicit pinMode for clarity, matches this project's style
 
   ConsumerControl.begin();
   USB.begin();
@@ -2760,6 +3086,7 @@ void loop() {
 
   ArduinoOTA.handle();
   WebSerial.loop();
+  serviceBuzzer(); // T60 — non-blocking pattern stepper, must run every pass regardless of what else loop() is doing
 
   // A successful HTTP-OTA upload or a /restart request (T26, set from the
   // AsyncTCP task — see setupHttpOta()'s comment) — reboot from here, not
@@ -2795,6 +3122,29 @@ void loop() {
       // is a harmless no-op the rest of the time, not a fresh overwrite.
       utcOffsetMinutes = result.utcOffsetMinutes;
       if (!result.timeZoneName.isEmpty()) timeZoneName = result.timeZoneName; // cosmetic only; don't blank it out on a transient miss
+      buzzerEnabled = result.buzzerEnabled;
+
+      // T60 (agent-monitor mode): independent of pcConnected — agent
+      // sessions come from pc-dash-app's hook forwarder (T58), a separate
+      // signal from the Core Audio/SMTC readback pcConnected tracks, even
+      // though they typically run on the same physical PC. Badge always
+      // reflects the latest aggregate; flash+buzz fire only on the edge
+      // into an attention state (needs-input/error), not on every poll that
+      // happens to still be in one.
+      bool wasAttention = (agentAggregateStatus == AGENT_STATUS_NEEDS_INPUT || agentAggregateStatus == AGENT_STATUS_ERROR);
+      bool agentStatusChanged = (agentAggregateStatus != result.agentAggregateStatus);
+      agentAggregateStatus = result.agentAggregateStatus;
+      agentAttentionCount = result.agentAttentionCount;
+      if (agentStatusChanged) updateAgentStatusBadge();
+      bool isAttention = (agentAggregateStatus == AGENT_STATUS_NEEDS_INPUT || agentAggregateStatus == AGENT_STATUS_ERROR);
+      if (!wasAttention && isAttention) {
+        lv_color_t flashColor = agentStatusColor(agentAggregateStatus);
+        triggerAgentFlash(flashColor);
+        startBuzzPattern(agentAggregateStatus == AGENT_STATUS_ERROR ? BUZZ_PATTERN_ERROR : BUZZ_PATTERN_NEEDS_INPUT,
+                          agentAggregateStatus == AGENT_STATUS_ERROR
+                              ? sizeof(BUZZ_PATTERN_ERROR) / sizeof(BUZZ_PATTERN_ERROR[0])
+                              : sizeof(BUZZ_PATTERN_NEEDS_INPUT) / sizeof(BUZZ_PATTERN_NEEDS_INPUT[0]));
+      }
 
       // Volume/mute/now-playing: only trust the payload once the companion
       // app has actually reported in on *this* poll (result.pcConnected) —
