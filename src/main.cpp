@@ -261,11 +261,19 @@ int agentAttentionCount = 0; // sessions currently needs-input or error
 // deadline — same "never delay(), always millis()-gated" shape as every
 // other timed effect in this file (e.g. showVolumeOverlay's fuse).
 struct BuzzStep { uint16_t freqHz; uint16_t onMs; uint16_t offMs; };
-// Two short high beeps vs. three lower ones — distinct enough by ear to
-// tell "needs your input" from "something errored" without looking, per
-// ECOSYSTEM_PLAN.md's "distinct patterns per notification tier" ask.
-constexpr BuzzStep BUZZ_PATTERN_NEEDS_INPUT[] = {{2200, 120, 90}, {2200, 120, 90}};
-constexpr BuzzStep BUZZ_PATTERN_ERROR[] = {{1100, 160, 110}, {1100, 160, 110}, {1100, 160, 110}};
+// Passive magnetic buzzer on IO17 — its acoustic output falls off steeply
+// away from mechanical resonance, so both tiers are driven at one tuned
+// frequency rather than the old 2200/1100 Hz split (the 1100 Hz "error" tone
+// in particular was well down the response curve and barely audible).
+// LilyGo's own factory firmware drives this exact buzzer at 2000 Hz, so
+// that's the starting point; refine it with the temporary `buzzsweep`
+// WebSerial command (see setupWebSerial()) and fold the loudest value back
+// into BUZZ_FREQ_HZ. Tiers stay distinguishable by *rhythm* — two short
+// beeps vs. three longer ones — not pitch, per ECOSYSTEM_PLAN.md's
+// "distinct patterns per notification tier" ask.
+constexpr uint16_t BUZZ_FREQ_HZ = 2000;
+constexpr BuzzStep BUZZ_PATTERN_NEEDS_INPUT[] = {{BUZZ_FREQ_HZ, 120, 90}, {BUZZ_FREQ_HZ, 120, 90}};
+constexpr BuzzStep BUZZ_PATTERN_ERROR[] = {{BUZZ_FREQ_HZ, 180, 120}, {BUZZ_FREQ_HZ, 180, 120}, {BUZZ_FREQ_HZ, 180, 120}};
 const BuzzStep *buzzPattern = nullptr;
 size_t buzzPatternLen = 0;
 size_t buzzStepIndex = 0;
@@ -280,8 +288,23 @@ bool buzzInOnPhase = false;
 // coordinate-first pattern as T57/T58's own wire-shape questions.
 bool buzzerEnabled = true;
 
+// --- Temporary buzzer resonance sweep (added 2026-08-31) -------------------
+// `buzzsweep` over WebSerial walks the buzzer from 1500 Hz to 4500 Hz in
+// 250 Hz steps, ~600ms each, printing every frequency so the loudest can be
+// picked by ear and folded into BUZZ_FREQ_HZ above; `buzz <hz>` spot-tests
+// one frequency; `buzz` alone replays the needs-input pattern. Serviced from
+// loop() like serviceBuzzer(), so it never blocks WebSerial/AsyncTCP.
+// Remove all of this once BUZZ_FREQ_HZ is tuned.
+constexpr uint16_t BUZZ_SWEEP_START_HZ = 1500;
+constexpr uint16_t BUZZ_SWEEP_END_HZ = 4500;
+constexpr uint16_t BUZZ_SWEEP_STEP_HZ = 250;
+constexpr uint16_t BUZZ_SWEEP_DWELL_MS = 600;
+bool buzzSweepActive = false;
+uint16_t buzzSweepFreq = 0;
+uint32_t buzzSweepStepUntilMs = 0;
+
 void startBuzzPattern(const BuzzStep *pattern, size_t len) {
-  if (!buzzerEnabled || len == 0) return;
+  if (!buzzerEnabled || len == 0 || buzzSweepActive) return;
   buzzPattern = pattern;
   buzzPatternLen = len;
   buzzStepIndex = 0;
@@ -308,6 +331,41 @@ void serviceBuzzer() {
     tone(PIN_BUZZER, buzzPattern[buzzStepIndex].freqHz);
     buzzStepUntilMs = millis() + buzzPattern[buzzStepIndex].onMs;
   }
+}
+
+void startBuzzSweep() {
+  buzzPlaying = false; // preempt any normal pattern
+  buzzSweepActive = true;
+  buzzSweepFreq = BUZZ_SWEEP_START_HZ;
+  tone(PIN_BUZZER, buzzSweepFreq);
+  buzzSweepStepUntilMs = millis() + BUZZ_SWEEP_DWELL_MS;
+  Serial.printf("buzzsweep: %u Hz\n", buzzSweepFreq);
+  WebSerial.printf("buzzsweep: %u Hz\n", buzzSweepFreq);
+}
+
+void serviceBuzzSweep() {
+  if (!buzzSweepActive) return;
+  if (millis() < buzzSweepStepUntilMs) return;
+  if (buzzSweepFreq >= BUZZ_SWEEP_END_HZ) {
+    noTone(PIN_BUZZER);
+    buzzSweepActive = false;
+    Serial.println("buzzsweep: done");
+    WebSerial.println("buzzsweep: done");
+    return;
+  }
+  buzzSweepFreq += BUZZ_SWEEP_STEP_HZ;
+  tone(PIN_BUZZER, buzzSweepFreq);
+  buzzSweepStepUntilMs = millis() + BUZZ_SWEEP_DWELL_MS;
+  Serial.printf("buzzsweep: %u Hz\n", buzzSweepFreq);
+  WebSerial.printf("buzzsweep: %u Hz\n", buzzSweepFreq);
+}
+
+void buzzSpotTest(uint16_t freqHz) {
+  buzzSweepActive = false;
+  buzzPlaying = false;
+  tone(PIN_BUZZER, freqHz, 600); // core schedules its own noTone after 600ms
+  Serial.printf("buzz: %u Hz for 600ms\n", freqHz);
+  WebSerial.printf("buzz: %u Hz for 600ms\n", freqHz);
 }
 
 // LVGL owns its own draw buffer and rendering entirely — this replaces the
@@ -2893,7 +2951,24 @@ AsyncWebServer webServer(80);
 void setupWebSerial() {
   if (WiFi.status() != WL_CONNECTED) return; // no WiFi, no WebSerial — same as OTA
   WebSerial.begin(&webServer);
-  WebSerial.onMessage([](const String &msg) { Serial.printf("WebSerial recv: %s\n", msg.c_str()); });
+  WebSerial.onMessage([](const String &msg) {
+    Serial.printf("WebSerial recv: %s\n", msg.c_str());
+    String m = msg;
+    m.trim();
+    if (m == "buzzsweep") {
+      startBuzzSweep();
+    } else if (m == "buzz") {
+      startBuzzPattern(BUZZ_PATTERN_NEEDS_INPUT,
+                       sizeof(BUZZ_PATTERN_NEEDS_INPUT) / sizeof(BUZZ_PATTERN_NEEDS_INPUT[0]));
+    } else if (m.startsWith("buzz ")) {
+      long f = m.substring(5).toInt();
+      if (f >= 100 && f <= 10000) {
+        buzzSpotTest((uint16_t)f);
+      } else {
+        WebSerial.println("buzz: freq must be 100-10000 Hz");
+      }
+    }
+  });
   webServer.begin();
   Serial.println("WebSerial ready at /webserial");
 }
@@ -3087,6 +3162,7 @@ void loop() {
   ArduinoOTA.handle();
   WebSerial.loop();
   serviceBuzzer(); // T60 — non-blocking pattern stepper, must run every pass regardless of what else loop() is doing
+  serviceBuzzSweep(); // temp — buzzer resonance sweep driven by the `buzzsweep` WebSerial command; remove with the rest once BUZZ_FREQ_HZ is tuned
 
   // A successful HTTP-OTA upload or a /restart request (T26, set from the
   // AsyncTCP task — see setupHttpOta()'s comment) — reboot from here, not
