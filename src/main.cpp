@@ -172,6 +172,10 @@ float ramPercent = 61;
 // (clock, weather, lights, settings) is unaffected either way.
 bool pcConnected = false;
 uint32_t lastSeenSecondsAgo = 0;
+// T76 — see PC_RECENT_INPUT_WINDOW_S's own comment and pollSyncState()'s
+// parsing of pcState.lastInputSecondsAgo. UINT32_MAX default (not 0) so
+// "no data yet" never reads as "PC just used" and forces the knob awake.
+uint32_t lastInputSecondsAgo = UINT32_MAX;
 // pc-dash-app verified live on real Windows hardware 2026-08-20 (reported via
 // the pc-dash coordinator) — offline dim treatment re-enabled now that there's
 // a real PC to go offline from. pcConnected itself, the sync poll, and NVS
@@ -394,6 +398,7 @@ lv_obj_t *cpuLabel, *gpuLabel, *ramLabel;
 lv_obj_t *homeOfflineLabel;
 lv_obj_t *agentStatusBadge;  // T60 — pulse-ring pattern, see its own build-site comment
 lv_obj_t *agentFlashOverlay; // T60 — one-shot full-panel tint on entering an attention state
+lv_obj_t *agentAttentionRing; // T77 — persistent global ring, see its own build-site comment
 
 uint32_t lvMillisCb() { return millis(); }
 
@@ -593,6 +598,39 @@ void updateAgentStatusBadge() {
 // square corners would show where the display can't actually render.
 void agentFlashAnimCb(void *obj, int32_t value) {
   lv_obj_set_style_bg_opa((lv_obj_t *)obj, (lv_opa_t)value, 0);
+}
+
+// T77: thin pulsing ring around the panel edge, global — lives on
+// lv_layer_top(), not any one screen's object tree, so it renders above
+// whichever screen is currently active and needs no per-screen wiring.
+// Persistent while the attention state holds (unlike agentFlashOverlay's
+// one-shot tint), and visible on every screen (unlike agentStatusBadge,
+// deliberately Home-only). Reuses agentAggregateStatus/agentStatusColor —
+// the same "needs-input or error" trigger T60's badge/flash already fire
+// on and T72's phone banner is scoped to reuse — so all three stay
+// consistent rather than re-deriving the edge condition three ways.
+// agentStatusBadge/agentFlashOverlay are left as-is; this is additive.
+// Reuses agentBadgePulseAnimCb (already a generic border-opacity animator,
+// not badge-specific) rather than duplicating the same three-line callback.
+void updateAgentAttentionRing() {
+  lv_anim_delete(agentAttentionRing, agentBadgePulseAnimCb);
+  bool attention = (agentAggregateStatus == AGENT_STATUS_NEEDS_INPUT || agentAggregateStatus == AGENT_STATUS_ERROR);
+  if (!attention) {
+    lv_obj_add_flag(agentAttentionRing, LV_OBJ_FLAG_HIDDEN);
+    return;
+  }
+  lv_obj_remove_flag(agentAttentionRing, LV_OBJ_FLAG_HIDDEN);
+  lv_obj_set_style_border_color(agentAttentionRing, agentStatusColor(agentAggregateStatus), 0);
+  lv_anim_t a;
+  lv_anim_init(&a);
+  lv_anim_set_var(&a, agentAttentionRing);
+  lv_anim_set_exec_cb(&a, agentBadgePulseAnimCb);
+  lv_anim_set_values(&a, LV_OPA_30, LV_OPA_COVER);
+  lv_anim_set_time(&a, 500);
+  lv_anim_set_playback_time(&a, 500); // fade back down, same shape as agentStatusBadge's own pulse
+  lv_anim_set_repeat_count(&a, LV_ANIM_REPEAT_INFINITE);
+  lv_anim_set_path_cb(&a, lv_anim_path_ease_in_out);
+  lv_anim_start(&a);
 }
 
 void triggerAgentFlash(lv_color_t color) {
@@ -1724,6 +1762,21 @@ bool displayDimmed = false;
 // own comment on this. Not operator-adjustable like idleToHomeMs/volumeFuseMs
 // (no request for that yet); a plain hardcoded constant until it is.
 constexpr uint32_t NOW_PLAYING_STOPPED_IDLE_MS = 5000;
+// T76 (2026-08-30): "stay awake while Brian's actively on the PC" — a
+// second, independent gate on top of the knob's own local idle timer
+// (dimDelayMs above), not a replacement for it. Threshold is Brian's own
+// decision (30 min), not proposed/adjustable like dimDelayMs/idleToHomeMs,
+// so a plain hardcoded constant, same as NOW_PLAYING_STOPPED_IDLE_MS above.
+// Consumes pcState.lastInputSecondsAgo — field shape confirmed directly with
+// pc-dash-app (cross-participant, same pattern as T8/T44/T52/T57; see
+// coordinator-reports/pc-dash.md): raw seconds since last real Windows
+// keyboard/mouse input (GetLastInputInfo), deliberately not a precomputed
+// bool, so the 30-min threshold stays knob-side tunable policy without an
+// app redeploy — same reasoning as utcOffsetMinutes (T44). Always sent,
+// excluded from pc-dash-app's own change-detection. Also needs pc-dash-hub
+// to add the field to its schema before it passes through end-to-end —
+// parsed defensively below (large default) so this stays a no-op until then.
+constexpr uint32_t PC_RECENT_INPUT_WINDOW_S = 30 * 60;
 // Defaults shown until the first pcConnected poll reconciles them (see
 // loop()'s sync-apply step) — String, not const char*, so a real synced
 // value (arbitrary length, e.g. actual SMTC track titles) can replace them.
@@ -2423,6 +2476,22 @@ void setupLVGL() {
   buildQuickJumpScreen(quickJumpScreen);
   idleScreen = lv_obj_create(NULL);
   buildIdleScreen(idleScreen);
+
+  // T77: parented to lv_layer_top(), the one LVGL layer that stays rendered
+  // above every screen regardless of which one is currently loaded — see
+  // updateAgentAttentionRing()'s own comment for why this lives here instead
+  // of as a per-screen child like agentStatusBadge/agentFlashOverlay.
+  agentAttentionRing = lv_obj_create(lv_layer_top());
+  lv_obj_remove_flag(agentAttentionRing, LV_OBJ_FLAG_SCROLLABLE);
+  lv_obj_remove_flag(agentAttentionRing, LV_OBJ_FLAG_CLICKABLE); // must not block touch/gestures on the screen underneath
+  lv_obj_set_size(agentAttentionRing, SCREEN_WIDTH - 4, SCREEN_HEIGHT - 4); // just inside the true bezel edge
+  lv_obj_center(agentAttentionRing);
+  lv_obj_set_style_radius(agentAttentionRing, LV_RADIUS_CIRCLE, 0);
+  lv_obj_set_style_bg_opa(agentAttentionRing, LV_OPA_TRANSP, 0); // ring only, no fill
+  lv_obj_set_style_border_width(agentAttentionRing, 6, 0); // thin, per spec — much lighter than agentStatusBadge's 7px on a 34px badge
+  lv_obj_set_style_pad_all(agentAttentionRing, 0, 0);
+  lv_obj_add_flag(agentAttentionRing, LV_OBJ_FLAG_HIDDEN); // shown by updateAgentAttentionRing() once there's a real attention state
+  updateAgentAttentionRing();
   // No gesture subscriptions/makeGestureBubbleThrough on idleScreen, deliberately
   // — a touch here should just wake the device (any touch already updates
   // lastAnyInteractionMs via lvTouchpadRead()), not trigger a specific
@@ -2596,6 +2665,11 @@ struct SyncResult {
   AgentStatus agentAggregateStatus;
   int agentAttentionCount;
   bool buzzerEnabled;
+  // T76 — see PC_RECENT_INPUT_WINDOW_S's own comment. Not "preserved unless
+  // a real value arrives" like volumeFuseMs/idleToHomeMs above: absence
+  // should read as "no recent PC input known," not "keep believing
+  // whatever the last poll said," so this defaults fresh every poll.
+  uint32_t lastInputSecondsAgo;
 };
 SyncResult pendingSyncResult;
 
@@ -2712,6 +2786,10 @@ bool pollSyncState() {
   result.idleToHomeMs = idleToHomeMs;
   result.dimDelayMs = dimDelayMs;
   result.utcOffsetMinutes = utcOffsetMinutes; // T44, same preserved-unless-real-value pattern
+  // T76 — fresh every poll, not preserved (see the field's own comment).
+  // Large enough that a missing/failed poll reads as "no recent input
+  // known" rather than accidentally satisfying PC_RECENT_INPUT_WINDOW_S.
+  result.lastInputSecondsAgo = UINT32_MAX;
   result.pcConnected = false;
   result.lastSeenSecondsAgo = 0;
   // Left at these neutral defaults (not read from the local globals — those
@@ -2782,6 +2860,13 @@ bool pollSyncState() {
         JsonObject pcState = doc["pcState"];
         result.pcConnected = pcState["pcConnected"] | false;
         result.lastSeenSecondsAgo = pcState["lastSeenSecondsAgo"] | 0;
+        // T76 — raw seconds since real Windows keyboard/mouse input
+        // (pc-dash-app's GetLastInputInfo), always sent once pc-dash-hub's
+        // schema carries it through; missing key (hub not updated yet, or
+        // pc-dash-app not reporting) falls back to the "no recent input
+        // known" default set above, so this is a safe no-op until both legs
+        // land — see PC_RECENT_INPUT_WINDOW_S's own comment.
+        result.lastInputSecondsAgo = pcState["lastInputSecondsAgo"] | UINT32_MAX;
         // T44/T48 (2026-08-26): local-time source for the idle screen,
         // confirmed shape from pc-dash-app via the coordinator —
         // utcOffsetMinutes (signed minutes east of UTC, e.g. -420 for
@@ -3188,6 +3273,7 @@ void loop() {
     if (result.ok) {
       bool wasPcConnected = pcConnected;
       pcConnected = result.pcConnected;
+      lastInputSecondsAgo = result.lastInputSecondsAgo; // T76
       lastSeenSecondsAgo = result.lastSeenSecondsAgo;
       volumeFuseMs = result.volumeFuseMs;
       idleToHomeMs = result.idleToHomeMs;
@@ -3211,7 +3297,10 @@ void loop() {
       bool agentStatusChanged = (agentAggregateStatus != result.agentAggregateStatus);
       agentAggregateStatus = result.agentAggregateStatus;
       agentAttentionCount = result.agentAttentionCount;
-      if (agentStatusChanged) updateAgentStatusBadge();
+      if (agentStatusChanged) {
+        updateAgentStatusBadge();
+        updateAgentAttentionRing(); // T77 — same change gate as the badge, ring is just as cheap to restart redundantly
+      }
       bool isAttention = (agentAggregateStatus == AGENT_STATUS_NEEDS_INPUT || agentAggregateStatus == AGENT_STATUS_ERROR);
       if (!wasAttention && isAttention) {
         lv_color_t flashColor = agentStatusColor(agentAggregateStatus);
@@ -3562,7 +3651,13 @@ void loop() {
   // by the time this runs, lv_screen_active() may already be neither
   // idleScreen nor Home — brightness still needs restoring regardless of
   // which screen that interaction actually landed on.
-  bool shouldBeIdle = (millis() - lastAnyInteractionMs) > dimDelayMs;
+  // T76: stay awake as long as EITHER signal says "active" — the knob's own
+  // local touch/rotation timer (unchanged, above) OR the PC itself having
+  // had real input within the last 30 min (pcConnected-gated: an unreached/
+  // never-reported hub must not be misread as "PC active", same reasoning
+  // as pcConnected's own offline-dim gating elsewhere in this file).
+  bool pcRecentlyActive = pcConnected && lastInputSecondsAgo <= PC_RECENT_INPUT_WINDOW_S;
+  bool shouldBeIdle = (millis() - lastAnyInteractionMs) > dimDelayMs && !pcRecentlyActive;
   if (shouldBeIdle && !displayDimmed) {
     displayDimmed = true;
     panel->setBrightness(DISPLAY_BRIGHTNESS_IDLE);
