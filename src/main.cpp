@@ -2742,7 +2742,17 @@ void pollAgentSessions(SyncResult &result) {
   int attentionCount = 0;
   int activeCount = 0;
   for (JsonObject s : sessions) {
-    if (s["stale"] | false) continue; // hub-side safety net for a hard-killed process (T57) — not actionable
+    // T83 (2026-09-01, Brian's correction): deliberately does NOT skip
+    // `stale` sessions anymore (used to: `if (s["stale"] | false)
+    // continue;`). The hub's 120s stale timeout meant a needs-input/error
+    // session that just sat ignored long enough silently dropped out of the
+    // aggregate — a false "all clear," not an actual resolution. Attention
+    // state should now only clear on a real status change (a hook event) or
+    // the session being removed (SessionEnd -> DELETE), regardless of age.
+    // Accepted trade-off: a session that hard-crashes without ever firing
+    // SessionEnd leaves the ring/buzzer stuck lit with no auto-recovery —
+    // Brian prefers that over this silent false-clear. Applies to both T60's
+    // buzz/badge and T77's ring, since they share this function's output.
     AgentStatus st = agentStatusFromString(s["status"] | "");
     if (st == AGENT_STATUS_DONE || st == AGENT_STATUS_NONE) continue; // finished/unrecognized sessions don't need attention
     activeCount++;
