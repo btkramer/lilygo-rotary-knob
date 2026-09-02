@@ -3179,6 +3179,15 @@ void setupWebSerial() {
 // either way, not OTA-specific despite the name history.
 bool rebootPending = false;
 uint32_t rebootAtMs = 0;
+
+// T95 (2026-09-02) — temporary buzzer-path diagnostics. `/debug/buzz` sets
+// buzzTestPending so loop() (never the AsyncTCP task — tone()/LEDC must not
+// run there, same reason /restart defers ESP.restart()) fires a pattern on
+// demand, isolating the hardware + startBuzzPattern() path from the
+// agent-status trigger logic. `/debug/agent` is a read-only curl-able dump
+// of the knob's own view of agent state. Remove both once T95 is closed.
+volatile bool buzzTestPending = false;
+volatile int buzzTestPattern = 0; // 0=needs-input, 1=error, 2=done
 // Tracks the in-flight upload's success across chunk calls — a single
 // global is fine, this endpoint only ever serves one upload at a time
 // (dev tool, not a public multi-client service). Real bug found 2026-08-21:
@@ -3312,6 +3321,32 @@ void setupHttpOta() {
     request->send(200, "text/plain", body);
   });
   Serial.println("Debug time readout ready at /debug/time");
+
+  // T95 (2026-09-02, temporary) — buzzer-path diagnostics, same auth as
+  // /restart. Remove once T95 is closed.
+  webServer.on("/debug/buzz", HTTP_GET, [](AsyncWebServerRequest *request) {
+    if (!request->authenticate("ota", OTA_PASSWORD)) return request->requestAuthentication();
+    int p = 0;
+    if (request->hasParam("pattern")) {
+      String v = request->getParam("pattern")->value();
+      if (v == "error") p = 1;
+      else if (v == "done") p = 2;
+    }
+    buzzTestPattern = p;
+    buzzTestPending = true;
+    request->send(200, "text/plain", String("buzz queued pattern=") + p + " buzzerEnabled=" + (buzzerEnabled ? 1 : 0) + "\n");
+  });
+  webServer.on("/debug/agent", HTTP_GET, [](AsyncWebServerRequest *request) {
+    if (!request->authenticate("ota", OTA_PASSWORD)) return request->requestAuthentication();
+    char body[256];
+    snprintf(body, sizeof(body),
+             "agentAggregateStatus=%d agentAttentionCount=%d buzzerEnabled=%d buzzPlaying=%d "
+             "attentionRenagMinutes=%u lastAttentionChimeMs=%u pcConnected=%d millis=%u\n",
+             (int)agentAggregateStatus, agentAttentionCount, buzzerEnabled ? 1 : 0, buzzPlaying ? 1 : 0,
+             attentionRenagMinutes, lastAttentionChimeMs, pcConnected ? 1 : 0, (unsigned)millis());
+    request->send(200, "text/plain", body);
+  });
+  Serial.println("Debug buzzer/agent readouts ready at /debug/buzz and /debug/agent");
 }
 
 void setup() {
@@ -3350,6 +3385,21 @@ void loop() {
   WebSerial.loop();
   serviceBuzzer(); // T60 — non-blocking pattern stepper, must run every pass regardless of what else loop() is doing
   serviceBuzzSweep(); // temp — buzzer resonance sweep driven by the `buzzsweep` WebSerial command; remove with the rest once BUZZ_FREQ_HZ is tuned
+
+  // T95 (2026-09-02, temporary) — service /debug/buzz. Deferred here off the
+  // AsyncTCP task, same reason as /restart. Remove once T95 is closed.
+  if (buzzTestPending) {
+    buzzTestPending = false;
+    const BuzzStep *pat = buzzTestPattern == 1 ? BUZZ_PATTERN_ERROR
+                        : buzzTestPattern == 2 ? BUZZ_PATTERN_DONE
+                                               : BUZZ_PATTERN_NEEDS_INPUT;
+    size_t plen = buzzTestPattern == 1 ? sizeof(BUZZ_PATTERN_ERROR) / sizeof(BUZZ_PATTERN_ERROR[0])
+                : buzzTestPattern == 2 ? sizeof(BUZZ_PATTERN_DONE) / sizeof(BUZZ_PATTERN_DONE[0])
+                                       : sizeof(BUZZ_PATTERN_NEEDS_INPUT) / sizeof(BUZZ_PATTERN_NEEDS_INPUT[0]);
+    Serial.printf("buzzTest: pattern=%d buzzerEnabled=%d buzzSweepActive=%d\n", buzzTestPattern, buzzerEnabled, buzzSweepActive);
+    WebSerial.printf("buzzTest: pattern=%d buzzerEnabled=%d buzzSweepActive=%d\n", buzzTestPattern, buzzerEnabled, buzzSweepActive);
+    startBuzzPattern(pat, plen);
+  }
 
   // T90/T89 (2026-09-02): re-nag — while the agent aggregate still needs a
   // human and the PC is still reachable, repeat the attention chime every
@@ -3410,6 +3460,7 @@ void loop() {
       // into an attention state (needs-input/error), not on every poll that
       // happens to still be in one.
       bool wasAttention = (agentAggregateStatus == AGENT_STATUS_NEEDS_INPUT || agentAggregateStatus == AGENT_STATUS_ERROR);
+      bool wasWorking = (agentAggregateStatus == AGENT_STATUS_WORKING);
       bool agentStatusChanged = (agentAggregateStatus != result.agentAggregateStatus);
       agentAggregateStatus = result.agentAggregateStatus;
       agentAttentionCount = result.agentAttentionCount;
@@ -3433,8 +3484,23 @@ void loop() {
       if (agentStatusChanged || pcConnected != wasPcConnected) {
         updateAgentStatusBadge();
         updateAgentAttentionRing(); // T77/T90/T91 — cheap to restart redundantly
+        Serial.printf("agentStatus: newAgg=%d wasWorking=%d wasAttention=%d pcConnected %d->%d doneFlag=%d\n",
+                      (int)result.agentAggregateStatus, wasWorking, wasAttention, wasPcConnected, pcConnected, result.agentDoneChime);
+        WebSerial.printf("agentStatus: newAgg=%d wasWorking=%d wasAttention=%d pcConnected %d->%d doneFlag=%d\n",
+                         (int)result.agentAggregateStatus, wasWorking, wasAttention, wasPcConnected, pcConnected, result.agentDoneChime);
       }
       bool isAttention = (agentAggregateStatus == AGENT_STATUS_NEEDS_INPUT || agentAggregateStatus == AGENT_STATUS_ERROR);
+      bool isWorking = (agentAggregateStatus == AGENT_STATUS_WORKING);
+      // T95 (2026-09-02): the completion chime originally fired only on an
+      // explicit `status:"done"` (T87). On real hardware Brian's Claude Code
+      // sessions emit `working`->`idle` on the Stop hook (agent finished a
+      // turn) and only `working`->`done` on SessionEnd (terminal closed) —
+      // so the common "work finished, come look" moment produced no chime.
+      // Broadened: fire once whenever the aggregate leaves `working` for any
+      // non-attention state (idle / none / done), OR on an explicit `done`.
+      // Flagged to the coordinator to confirm this matches intent.
+      bool workFinished = (wasWorking && !isWorking && !isAttention) ||
+                          (!isAttention && result.agentDoneChime);
       if (!wasAttention && isAttention) {
         // T90: entry chime + flash on crossing into needs-input/error. The
         // re-nag block further down in loop() repeats the chime every
@@ -3442,11 +3508,14 @@ void loop() {
         triggerAgentFlash(agentStatusColor(agentAggregateStatus));
         startAttentionChime();
         lastAttentionChimeMs = millis();
-      } else if (!isAttention && pcConnected && result.agentDoneChime) {
-        // T87: a session finished (working->done edge, deduped on stoppedAt
-        // in pollAgentSessions) and nothing else needs a human — one
-        // completion chime. Skipped while isAttention: needs-input wins.
+        Serial.printf("agentChime: ENTRY status=%d buzzerEnabled=%d\n", (int)agentAggregateStatus, buzzerEnabled);
+        WebSerial.printf("agentChime: ENTRY status=%d buzzerEnabled=%d\n", (int)agentAggregateStatus, buzzerEnabled);
+      } else if (workFinished) {
         startBuzzPattern(BUZZ_PATTERN_DONE, sizeof(BUZZ_PATTERN_DONE) / sizeof(BUZZ_PATTERN_DONE[0]));
+        Serial.printf("agentChime: DONE wasWorking=%d doneFlag=%d newStatus=%d buzzerEnabled=%d\n",
+                      wasWorking, result.agentDoneChime, (int)agentAggregateStatus, buzzerEnabled);
+        WebSerial.printf("agentChime: DONE wasWorking=%d doneFlag=%d newStatus=%d buzzerEnabled=%d\n",
+                         wasWorking, result.agentDoneChime, (int)agentAggregateStatus, buzzerEnabled);
       }
 
       // Volume/mute/now-playing: only trust the payload once the companion
