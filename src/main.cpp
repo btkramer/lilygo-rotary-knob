@@ -249,6 +249,21 @@ AgentStatus agentStatusFromString(const char *s) {
 AgentStatus agentAggregateStatus = AGENT_STATUS_NONE;
 int agentAttentionCount = 0; // sessions currently needs-input or error
 
+// T90 (2026-09-02) — attention-indicator reframe. The global ring
+// (agentAttentionRing, T77) now carries three meanings instead of only
+// firing on needs-input/error:
+//   - any session `working`, none needing input -> ORANGE pulse at the
+//     original T77 speed (RING_PULSE_WORKING_MS)
+//   - aggregate needs-input/error -> RED pulse, deliberately SLOWER than
+//     orange (Brian: "a bit slower") so the two read differently at a glance
+//   - otherwise -> ring hidden
+// needs-input still wins over working (agentStatusPriority already does
+// this). PC-offline (T91) hides the ring regardless of last-known state.
+constexpr uint32_t RING_PULSE_WORKING_MS = 500;    // == T77's original pulse half-cycle
+constexpr uint32_t RING_PULSE_ATTENTION_MS = 850;  // slower than working
+constexpr uint32_t RING_COLOR_WORKING = 0xFF8C00;  // orange (matches cpuArc)
+constexpr uint32_t RING_COLOR_ATTENTION = 0xFF3B30; // red (matches AGENT_STATUS_ERROR)
+
 // Buzzer (T60) — plain tone()/noTone() on PIN_BUZZER (17, confirmed in
 // pin_config.h). HARDWARE.md also notes a vibration motor on this board,
 // "unused so far" — deliberately NOT wired here too: its GPIO isn't
@@ -278,6 +293,11 @@ struct BuzzStep { uint16_t freqHz; uint16_t onMs; uint16_t offMs; };
 constexpr uint16_t BUZZ_FREQ_HZ = 2000;
 constexpr BuzzStep BUZZ_PATTERN_NEEDS_INPUT[] = {{BUZZ_FREQ_HZ, 120, 90}, {BUZZ_FREQ_HZ, 120, 90}};
 constexpr BuzzStep BUZZ_PATTERN_ERROR[] = {{BUZZ_FREQ_HZ, 180, 120}, {BUZZ_FREQ_HZ, 180, 120}, {BUZZ_FREQ_HZ, 180, 120}};
+// T87 (2026-09-02) — completion chime on the working->done edge. Two quick
+// beeps, snappier than needs-input's (90ms vs 120ms on-time) so it reads as
+// "finished" rather than "needs you" despite the passive buzzer's single
+// frequency. Retune by ear alongside the others if it's not distinct enough.
+constexpr BuzzStep BUZZ_PATTERN_DONE[] = {{BUZZ_FREQ_HZ, 90, 70}, {BUZZ_FREQ_HZ, 90, 70}};
 const BuzzStep *buzzPattern = nullptr;
 size_t buzzPatternLen = 0;
 size_t buzzStepIndex = 0;
@@ -291,6 +311,18 @@ bool buzzInOnPhase = false;
 // flagged to the coordinator for pc-dash-hub to confirm/correct, same
 // coordinate-first pattern as T57/T58's own wire-shape questions.
 bool buzzerEnabled = true;
+
+// T89 (2026-09-02) — hub-global re-nag interval for the attention chime, in
+// MINUTES (settings.attentionRenagMinutes, sibling to buzzerEnabled, NOT
+// under `timeouts`). While the aggregate is needs-input/error, the two-beep
+// chime repeats this often until the state resolves. 0 = disabled (entry
+// chime only). Default 5 (pc-dash-hub's documented default) until a real
+// value has synced; NVS-persisted like the timeouts.
+constexpr uint32_t ATTENTION_RENAG_MINUTES_DEFAULT = 5;
+uint32_t attentionRenagMinutes = ATTENTION_RENAG_MINUTES_DEFAULT;
+// millis() of the last attention chime (entry or re-nag) — see loop()'s
+// re-nag block and the sync-apply attention-edge handler.
+uint32_t lastAttentionChimeMs = 0;
 
 // --- Temporary buzzer resonance sweep (added 2026-08-31) -------------------
 // `buzzsweep` over WebSerial walks the buzzer from 1500 Hz to 4500 Hz in
@@ -316,6 +348,26 @@ void startBuzzPattern(const BuzzStep *pattern, size_t len) {
   buzzInOnPhase = true;
   tone(PIN_BUZZER, buzzPattern[0].freqHz);
   buzzStepUntilMs = millis() + buzzPattern[0].onMs;
+}
+
+// T91 (2026-09-02): hard-stop any in-progress chime — used when the PC goes
+// offline so a mid-pattern attention beep doesn't keep sounding after the
+// trigger is gone. Safe to call when nothing is playing.
+void stopBuzzPattern() {
+  if (!buzzPlaying) return;
+  noTone(PIN_BUZZER);
+  buzzPlaying = false;
+  buzzInOnPhase = false;
+}
+
+// T90 (2026-09-02) — fire the attention chime for the current aggregate
+// (needs-input vs error rhythm). Used both on the entry edge and by loop()'s
+// re-nag timer, so the pattern selection isn't duplicated.
+void startAttentionChime() {
+  bool isError = (agentAggregateStatus == AGENT_STATUS_ERROR);
+  startBuzzPattern(isError ? BUZZ_PATTERN_ERROR : BUZZ_PATTERN_NEEDS_INPUT,
+                   isError ? sizeof(BUZZ_PATTERN_ERROR) / sizeof(BUZZ_PATTERN_ERROR[0])
+                           : sizeof(BUZZ_PATTERN_NEEDS_INPUT) / sizeof(BUZZ_PATTERN_NEEDS_INPUT[0]));
 }
 
 void serviceBuzzer() {
@@ -615,19 +667,25 @@ void agentFlashAnimCb(void *obj, int32_t value) {
 void updateAgentAttentionRing() {
   lv_anim_delete(agentAttentionRing, agentBadgePulseAnimCb);
   bool attention = (agentAggregateStatus == AGENT_STATUS_NEEDS_INPUT || agentAggregateStatus == AGENT_STATUS_ERROR);
-  if (!attention) {
+  bool working = (agentAggregateStatus == AGENT_STATUS_WORKING);
+  // T91 (2026-09-02): PC-offline clears the ring regardless of the last-known
+  // agent aggregate — a needs-input state that was never resolved before the
+  // PC hibernated must not leave the ring flashing forever.
+  if (!pcConnected || (!attention && !working)) {
     lv_obj_add_flag(agentAttentionRing, LV_OBJ_FLAG_HIDDEN);
     return;
   }
   lv_obj_remove_flag(agentAttentionRing, LV_OBJ_FLAG_HIDDEN);
-  lv_obj_set_style_border_color(agentAttentionRing, agentStatusColor(agentAggregateStatus), 0);
+  lv_obj_set_style_border_color(agentAttentionRing,
+                                lv_color_hex(attention ? RING_COLOR_ATTENTION : RING_COLOR_WORKING), 0);
+  uint32_t pulseMs = attention ? RING_PULSE_ATTENTION_MS : RING_PULSE_WORKING_MS;
   lv_anim_t a;
   lv_anim_init(&a);
   lv_anim_set_var(&a, agentAttentionRing);
   lv_anim_set_exec_cb(&a, agentBadgePulseAnimCb);
   lv_anim_set_values(&a, LV_OPA_30, LV_OPA_COVER);
-  lv_anim_set_time(&a, 500);
-  lv_anim_set_playback_time(&a, 500); // fade back down, same shape as agentStatusBadge's own pulse
+  lv_anim_set_time(&a, pulseMs);
+  lv_anim_set_playback_time(&a, pulseMs); // fade back down, same shape as agentStatusBadge's own pulse
   lv_anim_set_repeat_count(&a, LV_ANIM_REPEAT_INFINITE);
   lv_anim_set_path_cb(&a, lv_anim_path_ease_in_out);
   lv_anim_start(&a);
@@ -2665,6 +2723,8 @@ struct SyncResult {
   AgentStatus agentAggregateStatus;
   int agentAttentionCount;
   bool buzzerEnabled;
+  uint32_t attentionRenagMinutes; // T89 — settings.attentionRenagMinutes; 0 = re-nag off
+  bool agentDoneChime;            // T87 — a session crossed working->done this poll
   // T76 — see PC_RECENT_INPUT_WINDOW_S's own comment. Not "preserved unless
   // a real value arrives" like volumeFuseMs/idleToHomeMs above: absence
   // should read as "no recent PC input known," not "keep believing
@@ -2741,7 +2801,30 @@ void pollAgentSessions(SyncResult &result) {
   AgentStatus worst = AGENT_STATUS_NONE;
   int attentionCount = 0;
   int activeCount = 0;
+  // T87 (2026-09-02): the hub's `done` snapshot lingers ~15 polls after
+  // stoppedAt (AGENT_SESSION_DONE_DECAY_SECONDS) before it recomputes to
+  // "idle" server-side — so dedupe the completion chime on the distinct
+  // `stoppedAt` ISO string (pc-dash-hub blessed this over a per-session
+  // last-status map). Small ring buffer covers the unlikely case of several
+  // sessions finishing inside the same decay window.
+  static String recentDoneChimed[5];
+  static uint8_t recentDoneIdx = 0;
   for (JsonObject s : sessions) {
+    const char *statusStr = s["status"] | "";
+    if (!strcmp(statusStr, "done")) {
+      const char *stoppedAt = s["stoppedAt"] | "";
+      if (stoppedAt[0]) {
+        bool seen = false;
+        for (int i = 0; i < 5; i++) {
+          if (recentDoneChimed[i] == stoppedAt) { seen = true; break; }
+        }
+        if (!seen) {
+          result.agentDoneChime = true;
+          recentDoneChimed[recentDoneIdx] = stoppedAt;
+          recentDoneIdx = (recentDoneIdx + 1) % 5;
+        }
+      }
+    }
     // T83 (2026-09-01, Brian's correction): deliberately does NOT skip
     // `stale` sessions anymore (used to: `if (s["stale"] | false)
     // continue;`). The hub's 120s stale timeout meant a needs-input/error
@@ -2753,8 +2836,8 @@ void pollAgentSessions(SyncResult &result) {
     // SessionEnd leaves the ring/buzzer stuck lit with no auto-recovery —
     // Brian prefers that over this silent false-clear. Applies to both T60's
     // buzz/badge and T77's ring, since they share this function's output.
-    AgentStatus st = agentStatusFromString(s["status"] | "");
-    if (st == AGENT_STATUS_DONE || st == AGENT_STATUS_NONE) continue; // finished/unrecognized sessions don't need attention
+    AgentStatus st = agentStatusFromString(statusStr);
+    if (st == AGENT_STATUS_DONE || st == AGENT_STATUS_NONE) continue; // finished/unrecognized sessions don't hold the ring (T87: `done` is transient-terminal, not active)
     activeCount++;
     if (st == AGENT_STATUS_NEEDS_INPUT || st == AGENT_STATUS_ERROR) attentionCount++;
     if (agentStatusPriority(st) > agentStatusPriority(worst)) worst = st;
@@ -2825,6 +2908,8 @@ bool pollSyncState() {
   result.agentAggregateStatus = agentAggregateStatus;
   result.agentAttentionCount = agentAttentionCount;
   result.buzzerEnabled = buzzerEnabled;
+  result.attentionRenagMinutes = attentionRenagMinutes; // T89 — preserved unless the settings blob carries a new value
+  result.agentDoneChime = false; // T87 — event flag, only set true by pollAgentSessions() on a real working->done edge
 
   if (WiFi.status() == WL_CONNECTED) {
     String body;
@@ -2861,6 +2946,12 @@ bool pollSyncState() {
         // coordinate-first wire-shape questions.
         result.buzzerEnabled = doc["settings"]["buzzerEnabled"] | buzzerEnabled;
         if (result.buzzerEnabled != buzzerEnabled) syncPrefs.putBool("buzzerEn", result.buzzerEnabled);
+        // T89: hub-global re-nag interval, echoed read-only into this same
+        // settings block (canonical store is /api/settings, which we don't
+        // touch). Minutes, not Ms — deliberately not under `timeouts`.
+        // Absent key keeps the current value; 0 is valid ("re-nag off").
+        result.attentionRenagMinutes = doc["settings"]["attentionRenagMinutes"] | attentionRenagMinutes;
+        if (result.attentionRenagMinutes != attentionRenagMinutes) syncPrefs.putUInt("renagMin", result.attentionRenagMinutes);
         // pc-dash-app (step 4) is live now (2026-08-20) — pcState carries
         // real volume/mute/now-playing values, reconciled against the local
         // knob-driven estimate in loop() once pcConnected is true (T14,
@@ -2964,8 +3055,9 @@ void setupSyncSettings() {
   dimDelayMs = syncPrefs.getUInt("dimDelayMs", DIM_DELAY_MS_DEFAULT);
   utcOffsetMinutes = syncPrefs.getInt("utcOffMin", 0); // T44 — 0 (plain UTC) until a real value has ever synced
   buzzerEnabled = syncPrefs.getBool("buzzerEn", true); // T60 — on by default until a real value has ever synced
-  Serial.printf("sync: loaded from NVS: volumeFuseMs=%u idleToHomeMs=%u dimDelayMs=%u utcOffsetMinutes=%d buzzerEnabled=%d\n",
-                volumeFuseMs, idleToHomeMs, dimDelayMs, utcOffsetMinutes, buzzerEnabled);
+  attentionRenagMinutes = syncPrefs.getUInt("renagMin", ATTENTION_RENAG_MINUTES_DEFAULT); // T89
+  Serial.printf("sync: loaded from NVS: volumeFuseMs=%u idleToHomeMs=%u dimDelayMs=%u utcOffsetMinutes=%d buzzerEnabled=%d attentionRenagMinutes=%u\n",
+                volumeFuseMs, idleToHomeMs, dimDelayMs, utcOffsetMinutes, buzzerEnabled, attentionRenagMinutes);
 
   syncResultMutex = xSemaphoreCreateMutex();
   xTaskCreatePinnedToCore(syncPollTask, "syncPoll", 8192, NULL, 1, NULL, 0);
@@ -3259,6 +3351,19 @@ void loop() {
   serviceBuzzer(); // T60 — non-blocking pattern stepper, must run every pass regardless of what else loop() is doing
   serviceBuzzSweep(); // temp — buzzer resonance sweep driven by the `buzzsweep` WebSerial command; remove with the rest once BUZZ_FREQ_HZ is tuned
 
+  // T90/T89 (2026-09-02): re-nag — while the agent aggregate still needs a
+  // human and the PC is still reachable, repeat the attention chime every
+  // attentionRenagMinutes (0 = disabled). The entry chime sets the anchor
+  // (sync-apply block above); T91's PC-offline path can't reach here since
+  // this is pcConnected-gated, and the aggregate reverting to working/idle
+  // stops it naturally.
+  if (pcConnected && attentionRenagMinutes > 0 &&
+      (agentAggregateStatus == AGENT_STATUS_NEEDS_INPUT || agentAggregateStatus == AGENT_STATUS_ERROR) &&
+      (millis() - lastAttentionChimeMs) >= attentionRenagMinutes * 60000UL) {
+    startAttentionChime();
+    lastAttentionChimeMs = millis();
+  }
+
   // A successful HTTP-OTA upload or a /restart request (T26, set from the
   // AsyncTCP task — see setupHttpOta()'s comment) — reboot from here, not
   // inline in either handler, so the AsyncTCP task gets a chance to actually
@@ -3295,6 +3400,7 @@ void loop() {
       utcOffsetMinutes = result.utcOffsetMinutes;
       if (!result.timeZoneName.isEmpty()) timeZoneName = result.timeZoneName; // cosmetic only; don't blank it out on a transient miss
       buzzerEnabled = result.buzzerEnabled;
+      attentionRenagMinutes = result.attentionRenagMinutes; // T89
 
       // T60 (agent-monitor mode): independent of pcConnected — agent
       // sessions come from pc-dash-app's hook forwarder (T58), a separate
@@ -3307,18 +3413,40 @@ void loop() {
       bool agentStatusChanged = (agentAggregateStatus != result.agentAggregateStatus);
       agentAggregateStatus = result.agentAggregateStatus;
       agentAttentionCount = result.agentAttentionCount;
-      if (agentStatusChanged) {
+      // T91 (2026-09-02): PC just went offline — clear the attention ring and
+      // silence any repeating attention chime. updateAgentAttentionRing() now
+      // hides the ring whenever !pcConnected; the buzzer is stopped outright
+      // so a mid-pattern chime doesn't keep going after the PC is gone.
+      if (wasPcConnected && !pcConnected) {
+        stopBuzzPattern();
+        // T92 (2026-09-02): PC offline -> drop the knob straight into sleep
+        // mode now, rather than waiting out the full dimDelayMs of no local
+        // interaction. Backdating the local interaction clock lets the
+        // existing idle-state machine in loop() do the actual transition
+        // (idleScreen + DISPLAY_BRIGHTNESS_IDLE) and, importantly, its normal
+        // wake path still works: a real rotation/touch/press resets
+        // lastAnyInteractionMs and wakes as usual. pcRecentlyActive is
+        // already false while offline, so nothing fights this.
+        uint32_t nowMs = millis();
+        lastAnyInteractionMs = (nowMs > dimDelayMs) ? (nowMs - dimDelayMs) : 0;
+      }
+      if (agentStatusChanged || pcConnected != wasPcConnected) {
         updateAgentStatusBadge();
-        updateAgentAttentionRing(); // T77 — same change gate as the badge, ring is just as cheap to restart redundantly
+        updateAgentAttentionRing(); // T77/T90/T91 — cheap to restart redundantly
       }
       bool isAttention = (agentAggregateStatus == AGENT_STATUS_NEEDS_INPUT || agentAggregateStatus == AGENT_STATUS_ERROR);
       if (!wasAttention && isAttention) {
-        lv_color_t flashColor = agentStatusColor(agentAggregateStatus);
-        triggerAgentFlash(flashColor);
-        startBuzzPattern(agentAggregateStatus == AGENT_STATUS_ERROR ? BUZZ_PATTERN_ERROR : BUZZ_PATTERN_NEEDS_INPUT,
-                          agentAggregateStatus == AGENT_STATUS_ERROR
-                              ? sizeof(BUZZ_PATTERN_ERROR) / sizeof(BUZZ_PATTERN_ERROR[0])
-                              : sizeof(BUZZ_PATTERN_NEEDS_INPUT) / sizeof(BUZZ_PATTERN_NEEDS_INPUT[0]));
+        // T90: entry chime + flash on crossing into needs-input/error. The
+        // re-nag block further down in loop() repeats the chime every
+        // attentionRenagMinutes from this anchor until the state resolves.
+        triggerAgentFlash(agentStatusColor(agentAggregateStatus));
+        startAttentionChime();
+        lastAttentionChimeMs = millis();
+      } else if (!isAttention && pcConnected && result.agentDoneChime) {
+        // T87: a session finished (working->done edge, deduped on stoppedAt
+        // in pollAgentSessions) and nothing else needs a human — one
+        // completion chime. Skipped while isAttention: needs-input wins.
+        startBuzzPattern(BUZZ_PATTERN_DONE, sizeof(BUZZ_PATTERN_DONE) / sizeof(BUZZ_PATTERN_DONE[0]));
       }
 
       // Volume/mute/now-playing: only trust the payload once the companion
