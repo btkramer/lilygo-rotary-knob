@@ -370,6 +370,23 @@ void startAttentionChime() {
                            : sizeof(BUZZ_PATTERN_NEEDS_INPUT) / sizeof(BUZZ_PATTERN_NEEDS_INPUT[0]));
 }
 
+// T98 (2026-09-02) — TEMP WebSerial buzzer-pattern audition bench. Lets Brian
+// try candidate beep rhythms by ear (via `snd ...` in WebSerial, see
+// setupWebSerial()) before the beep vocabulary is locked. Deliberately ignores
+// buzzerEnabled — it's a manual test trigger, not a real notification. Strip
+// this helper, the `sndTestSteps` buffer, and the `snd ...` command block once
+// the beep vocab is finalized (same category as `buzzsweep`/`/debug/buzz`).
+constexpr size_t SND_TEST_MAX_STEPS = 16;
+BuzzStep sndTestSteps[SND_TEST_MAX_STEPS];
+void playSndTest(const BuzzStep *src, size_t len) {
+  if (len == 0 || len > SND_TEST_MAX_STEPS || buzzSweepActive) return;
+  for (size_t i = 0; i < len; i++) sndTestSteps[i] = src[i];
+  bool prev = buzzerEnabled;
+  buzzerEnabled = true;                 // force-play regardless of the setting
+  startBuzzPattern(sndTestSteps, len);  // only reads buzzerEnabled at entry
+  buzzerEnabled = prev;
+}
+
 void serviceBuzzer() {
   if (!buzzPlaying) return;
   if (millis() < buzzStepUntilMs) return;
@@ -3153,6 +3170,63 @@ void setupWebSerial() {
         buzzSpotTest((uint16_t)f);
       } else {
         WebSerial.println("buzz: freq must be 100-10000 Hz");
+      }
+    } else if (m.startsWith("snd ")) {
+      // T98 (2026-09-02) — TEMP beep-vocab audition bench. Strip with the rest
+      // of the buzzer test instrumentation once the vocabulary is locked.
+      String a = m.substring(4);
+      a.trim();
+      if (a == "complete") {
+        BuzzStep s[] = {{BUZZ_FREQ_HZ, 70, 60}, {BUZZ_FREQ_HZ, 70, 0}};
+        playSndTest(s, 2);
+        WebSerial.println("snd: complete  70/60/70");
+      } else if (a == "needsinput") {
+        BuzzStep s[] = {{BUZZ_FREQ_HZ, 160, 110}, {BUZZ_FREQ_HZ, 160, 0}};
+        playSndTest(s, 2);
+        WebSerial.println("snd: needsinput  160/110/160");
+      } else if (a == "error") {
+        BuzzStep s[] = {{BUZZ_FREQ_HZ, 90, 70}, {BUZZ_FREQ_HZ, 90, 70},
+                        {BUZZ_FREQ_HZ, 90, 70}, {BUZZ_FREQ_HZ, 90, 0}};
+        playSndTest(s, 4);
+        WebSerial.println("snd: error  90/70 x4");
+      } else if (a == "renag") {
+        BuzzStep s[] = {{BUZZ_FREQ_HZ, 160, 0}};
+        playSndTest(s, 1);
+        WebSerial.println("snd: renag  160");
+      } else if (a.startsWith("raw ")) {
+        String list = a.substring(4);
+        long vals[SND_TEST_MAX_STEPS * 2];
+        int n = 0;
+        int start = 0;
+        while (start <= (int)list.length() && n < (int)(SND_TEST_MAX_STEPS * 2)) {
+          int comma = list.indexOf(',', start);
+          String tok = (comma < 0) ? list.substring(start) : list.substring(start, comma);
+          tok.trim();
+          if (tok.length() > 0) {
+            long v = tok.toInt();
+            if (v < 0) v = 0;
+            if (v > 5000) v = 5000;
+            vals[n++] = v;
+          }
+          if (comma < 0) break;
+          start = comma + 1;
+        }
+        if (n == 0) {
+          WebSerial.println("snd raw: need a comma list of ms, e.g. snd raw 70,60,70");
+        } else {
+          size_t steps = (n + 1) / 2;
+          if (steps > SND_TEST_MAX_STEPS) steps = SND_TEST_MAX_STEPS;
+          BuzzStep s[SND_TEST_MAX_STEPS];
+          for (size_t i = 0; i < steps; i++) {
+            s[i].freqHz = BUZZ_FREQ_HZ;
+            s[i].onMs = (uint16_t)vals[2 * i];
+            s[i].offMs = (2 * i + 1 < n) ? (uint16_t)vals[2 * i + 1] : 0;
+          }
+          playSndTest(s, steps);
+          WebSerial.printf("snd raw: %d step(s)\n", (int)steps);
+        }
+      } else {
+        WebSerial.println("snd: complete | needsinput | error | renag | raw <ms,ms,...>");
       }
     }
   });
