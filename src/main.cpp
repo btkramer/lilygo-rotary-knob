@@ -311,11 +311,17 @@ struct BuzzStep { uint16_t freqHz; uint16_t onMs; uint16_t offMs; };
 constexpr uint16_t BUZZ_FREQ_HZ = 2000;
 constexpr BuzzStep BUZZ_PATTERN_NEEDS_INPUT[] = {{BUZZ_FREQ_HZ, 120, 90}, {BUZZ_FREQ_HZ, 120, 90}};
 constexpr BuzzStep BUZZ_PATTERN_ERROR[] = {{BUZZ_FREQ_HZ, 180, 120}, {BUZZ_FREQ_HZ, 180, 120}, {BUZZ_FREQ_HZ, 180, 120}};
-// T87 (2026-09-02) — completion chime on the working->done edge. Two quick
-// beeps, snappier than needs-input's (90ms vs 120ms on-time) so it reads as
-// "finished" rather than "needs you" despite the passive buzzer's single
-// frequency. Retune by ear alongside the others if it's not distinct enough.
-constexpr BuzzStep BUZZ_PATTERN_DONE[] = {{BUZZ_FREQ_HZ, 90, 70}, {BUZZ_FREQ_HZ, 90, 70}};
+// T87/T99 (2026-09-03) — two-tier completion chime, both values Brian
+// approved by ear via the T98 WebSerial audition bench (`snd complete` /
+// `snd raw`):
+//   - PARTIAL: some other tracked session is still `working` when this one
+//     finishes — same "quick, not urgent" chime as before, just retuned.
+//   - ALL_CLEAR: this was the last `working` session — a third, longer
+//     trailing beep marks "nothing left running," distinct from PARTIAL at a
+//     glance without needing a different pitch.
+// Which one plays is decided in pollAgentSessions() (see its own comment).
+constexpr BuzzStep BUZZ_PATTERN_DONE[] = {{BUZZ_FREQ_HZ, 70, 60}, {BUZZ_FREQ_HZ, 70, 0}};
+constexpr BuzzStep BUZZ_PATTERN_ALL_CLEAR[] = {{BUZZ_FREQ_HZ, 70, 60}, {BUZZ_FREQ_HZ, 70, 60}, {BUZZ_FREQ_HZ, 90, 0}};
 const BuzzStep *buzzPattern = nullptr;
 size_t buzzPatternLen = 0;
 size_t buzzStepIndex = 0;
@@ -2775,7 +2781,8 @@ struct SyncResult {
   int agentAttentionCount;
   bool buzzerEnabled;
   uint32_t attentionRenagMinutes; // T89 — settings.attentionRenagMinutes; 0 = re-nag off
-  bool agentDoneChime;            // T87/T99 — a tracked session crossed working->done/idle this poll
+  bool agentDoneChime;            // T87/T99 — a tracked session crossed working->done/idle this poll, AND another session is still working (PARTIAL chime)
+  bool agentAllClearChime;        // T99 — a tracked session crossed working->done/idle this poll, AND no session is still working (ALL_CLEAR chime)
   bool agentPollOk;              // T99 #3 — agent-sessions GET+parse succeeded this poll (independent of the pcState GET / result.ok)
   // T76 — see PC_RECENT_INPUT_WINDOW_S's own comment. Not "preserved unless
   // a real value arrives" like volumeFuseMs/idleToHomeMs above: absence
@@ -2883,6 +2890,8 @@ void pollAgentSessions(SyncResult &result) {
   int attentionCount = 0;
   int activeCount = 0;
   bool slotSeen[16] = {false};
+  bool anyFinishEdge = false; // T99 two-tier chime — some tracked session went working->done/idle this poll
+  bool anyWorkingNow = false; // T99 two-tier chime — is any session (post-update) still working
   String sessList; // T99 instrumentation — "project:status,..." for /debug/agent
   for (JsonObject s : sessions) {
     const char *statusStr = s["status"] | "";
@@ -2907,7 +2916,7 @@ void pollAgentSessions(SyncResult &result) {
       if (slot >= 0) {
         if (agentSessionSlots[slot].status == AGENT_STATUS_WORKING &&
             (st == AGENT_STATUS_DONE || st == AGENT_STATUS_IDLE)) {
-          result.agentDoneChime = true;
+          anyFinishEdge = true;
         }
         agentSessionSlots[slot].status = st;
         slotSeen[slot] = true;
@@ -2936,6 +2945,7 @@ void pollAgentSessions(SyncResult &result) {
     // buzz/badge and T77's ring, since they share this function's output.
     if (st == AGENT_STATUS_DONE || st == AGENT_STATUS_NONE) continue; // finished/unrecognized sessions don't hold the ring (T87: `done` is transient-terminal, not active)
     activeCount++;
+    if (st == AGENT_STATUS_WORKING) anyWorkingNow = true; // T99 two-tier chime
     if (st == AGENT_STATUS_NEEDS_INPUT || st == AGENT_STATUS_ERROR) attentionCount++;
     if (agentStatusPriority(st) > agentStatusPriority(worst)) worst = st;
   }
@@ -2944,6 +2954,15 @@ void pollAgentSessions(SyncResult &result) {
   // spuriously match a future session.
   for (int i = 0; i < 16; i++) {
     if (!slotSeen[i]) agentSessionSlots[i].id[0] = 0;
+  }
+  // T99 (2026-09-03): two-tier completion chime, decided once per poll from
+  // this same snapshot — PARTIAL if some other tracked session is still
+  // `working` right now, ALL_CLEAR if this poll's finish edge(s) left none
+  // working. Mutually exclusive; loop() picks the buzz pattern from whichever
+  // is set.
+  if (anyFinishEdge) {
+    if (anyWorkingNow) result.agentDoneChime = true;
+    else result.agentAllClearChime = true;
   }
   result.agentAggregateStatus = (activeCount > 0) ? worst : AGENT_STATUS_NONE;
   result.agentAttentionCount = attentionCount;
@@ -3013,7 +3032,8 @@ bool pollSyncState() {
   result.agentAttentionCount = agentAttentionCount;
   result.buzzerEnabled = buzzerEnabled;
   result.attentionRenagMinutes = attentionRenagMinutes; // T89 — preserved unless the settings blob carries a new value
-  result.agentDoneChime = false; // T87/T99 — event flag, only set true by pollAgentSessions() on a real per-session working->done/idle edge
+  result.agentDoneChime = false;     // T87/T99 — event flag, only set true by pollAgentSessions() on a real per-session working->done/idle edge
+  result.agentAllClearChime = false; // T99 — event flag, see agentDoneChime's own comment
   result.agentPollOk = false;    // T99 #3 — set true only on a successful agent-sessions GET+parse
 
   if (WiFi.status() == WL_CONNECTED) {
@@ -3750,23 +3770,31 @@ void loop() {
                          (int)agentAggregateStatus, wasAttention, wasPcConnected, pcConnected, result.agentDoneChime, result.ok);
       }
       bool isAttention = (agentAggregateStatus == AGENT_STATUS_NEEDS_INPUT || agentAggregateStatus == AGENT_STATUS_ERROR);
-      // T99 #1: completion chime is now driven purely by the per-session
+      // T99 #1: completion chime is driven purely by the per-session
       // working->done/idle edge detected in pollAgentSessions() — fires even
       // while other sessions (an always-on coordinator) stay working, which
       // the old aggregate-transition trigger structurally could not.
       // Suppressed while the aggregate needs a human, so a finish never steps
-      // on an active needs-input chime.
-      bool workFinished = (!isAttention && result.agentDoneChime);
+      // on an active needs-input chime. Two-tier (2026-09-03, Brian-approved
+      // via the T98 audition bench): PARTIAL when another session is still
+      // working, ALL_CLEAR when this was the last one — pollAgentSessions()
+      // decides which (mutually exclusive) from the same poll's snapshot.
+      bool partialFinished = (!isAttention && result.agentDoneChime);
+      bool allClearFinished = (!isAttention && result.agentAllClearChime);
       if (!wasAttention && isAttention) {
         triggerAgentFlash(agentStatusColor(agentAggregateStatus));
         startAttentionChime();
         lastAttentionChimeMs = millis();
         Serial.printf("agentChime: ENTRY status=%d buzzerEnabled=%d\n", (int)agentAggregateStatus, buzzerEnabled);
         WebSerial.printf("agentChime: ENTRY status=%d buzzerEnabled=%d\n", (int)agentAggregateStatus, buzzerEnabled);
-      } else if (workFinished) {
+      } else if (allClearFinished) {
+        startBuzzPattern(BUZZ_PATTERN_ALL_CLEAR, sizeof(BUZZ_PATTERN_ALL_CLEAR) / sizeof(BUZZ_PATTERN_ALL_CLEAR[0]));
+        Serial.printf("agentChime: ALL_CLEAR newStatus=%d buzzerEnabled=%d\n", (int)agentAggregateStatus, buzzerEnabled);
+        WebSerial.printf("agentChime: ALL_CLEAR newStatus=%d buzzerEnabled=%d\n", (int)agentAggregateStatus, buzzerEnabled);
+      } else if (partialFinished) {
         startBuzzPattern(BUZZ_PATTERN_DONE, sizeof(BUZZ_PATTERN_DONE) / sizeof(BUZZ_PATTERN_DONE[0]));
-        Serial.printf("agentChime: DONE (per-session) newStatus=%d buzzerEnabled=%d\n", (int)agentAggregateStatus, buzzerEnabled);
-        WebSerial.printf("agentChime: DONE (per-session) newStatus=%d buzzerEnabled=%d\n", (int)agentAggregateStatus, buzzerEnabled);
+        Serial.printf("agentChime: DONE (partial, per-session) newStatus=%d buzzerEnabled=%d\n", (int)agentAggregateStatus, buzzerEnabled);
+        WebSerial.printf("agentChime: DONE (partial, per-session) newStatus=%d buzzerEnabled=%d\n", (int)agentAggregateStatus, buzzerEnabled);
       }
     }
   }
