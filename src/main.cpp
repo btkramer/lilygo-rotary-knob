@@ -249,6 +249,23 @@ AgentStatus agentStatusFromString(const char *s) {
 AgentStatus agentAggregateStatus = AGENT_STATUS_NONE;
 int agentAttentionCount = 0; // sessions currently needs-input or error
 
+// T99 (2026-09-03) — agent-feed freshness. The orange WORKING ring is driven
+// off the agent-sessions feed alone (not pcConnected, which is pc-dash-app's
+// separate SMTC signal — see updateAgentAttentionRing()), so it needs its own
+// "is this data still current" gate: hide the working ring if no agent poll
+// has succeeded within AGENT_FEED_STALE_MS. Set from loop()'s agent-apply block.
+uint32_t lastAgentPollOkMs = 0;
+int agentRingRendered = -1; // 0 hidden / 1 working / 2 attention — also read by /debug/agent
+
+// T99 (2026-09-03, temporary) — /debug/agent instrumentation. Captured by
+// pollAgentSessions() each poll so the fetch/parse can be inspected remotely
+// without serial. Strip with the rest of the agent debug code once the ring
+// is confirmed working end-to-end.
+int dbgAgentGetCode = 0;
+size_t dbgAgentBodyLen = 0;
+char dbgAgentParseErr[24] = "none";
+char dbgAgentSessions[256] = "";
+
 // T90 (2026-09-02) — attention-indicator reframe. The global ring
 // (agentAttentionRing, T77) now carries three meanings instead of only
 // firing on needs-input/error:
@@ -263,6 +280,7 @@ constexpr uint32_t RING_PULSE_WORKING_MS = 500;    // == T77's original pulse ha
 constexpr uint32_t RING_PULSE_ATTENTION_MS = 850;  // slower than working
 constexpr uint32_t RING_COLOR_WORKING = 0xFF8C00;  // orange (matches cpuArc)
 constexpr uint32_t RING_COLOR_ATTENTION = 0xFF3B30; // red (matches AGENT_STATUS_ERROR)
+constexpr uint32_t AGENT_FEED_STALE_MS = 9000;      // T99 — 3x AGENT_SESSIONS_POLL_INTERVAL_MS; working ring hides if the feed is older
 
 // Buzzer (T60) — plain tone()/noTone() on PIN_BUZZER (17, confirmed in
 // pin_config.h). HARDWARE.md also notes a vibration motor on this board,
@@ -681,21 +699,37 @@ void agentFlashAnimCb(void *obj, int32_t value) {
 // agentStatusBadge/agentFlashOverlay are left as-is; this is additive.
 // Reuses agentBadgePulseAnimCb (already a generic border-opacity animator,
 // not badge-specific) rather than duplicating the same three-line callback.
+// T99 (2026-09-03): idempotent — tracks the last-rendered state in
+// agentRingRendered and no-ops when it hasn't changed, so loop()'s periodic
+// refresh (#7) can call this every pass without restarting the pulse anim.
+// Also decouples the WORKING ring from pcConnected (#2): the orange ring is
+// driven purely by the agent-sessions feed + its own freshness
+// (AGENT_FEED_STALE_MS), since agent sessions arrive via pc-dash-app's hook
+// forwarder — a separate signal from the SMTC/Core-Audio readback pcConnected
+// tracks. The needs-input/error (red) ring KEEPS the pcConnected gate (T91):
+// a PC hibernating must not leave it flashing forever. A session that crashed
+// without SessionEnd still holds the red ring (T83) — pcConnected is true in
+// that case.
 void updateAgentAttentionRing() {
-  lv_anim_delete(agentAttentionRing, agentBadgePulseAnimCb);
   bool attention = (agentAggregateStatus == AGENT_STATUS_NEEDS_INPUT || agentAggregateStatus == AGENT_STATUS_ERROR);
   bool working = (agentAggregateStatus == AGENT_STATUS_WORKING);
-  // T91 (2026-09-02): PC-offline clears the ring regardless of the last-known
-  // agent aggregate — a needs-input state that was never resolved before the
-  // PC hibernated must not leave the ring flashing forever.
-  if (!pcConnected || (!attention && !working)) {
+  bool agentFeedFresh = lastAgentPollOkMs != 0 && (millis() - lastAgentPollOkMs) < AGENT_FEED_STALE_MS;
+  bool showAttention = attention && pcConnected;      // T91 — unchanged
+  bool showWorking = working && agentFeedFresh;       // T99 #2 — no pcConnected term
+  int desired = showAttention ? 2 : (showWorking ? 1 : 0); // attention wins over working
+  if (desired == agentRingRendered) return;           // idempotent — nothing to do
+  agentRingRendered = desired;
+
+  lv_anim_delete(agentAttentionRing, agentBadgePulseAnimCb);
+  if (desired == 0) {
     lv_obj_add_flag(agentAttentionRing, LV_OBJ_FLAG_HIDDEN);
     return;
   }
+  bool isAttentionRing = (desired == 2);
   lv_obj_remove_flag(agentAttentionRing, LV_OBJ_FLAG_HIDDEN);
   lv_obj_set_style_border_color(agentAttentionRing,
-                                lv_color_hex(attention ? RING_COLOR_ATTENTION : RING_COLOR_WORKING), 0);
-  uint32_t pulseMs = attention ? RING_PULSE_ATTENTION_MS : RING_PULSE_WORKING_MS;
+                                lv_color_hex(isAttentionRing ? RING_COLOR_ATTENTION : RING_COLOR_WORKING), 0);
+  uint32_t pulseMs = isAttentionRing ? RING_PULSE_ATTENTION_MS : RING_PULSE_WORKING_MS;
   lv_anim_t a;
   lv_anim_init(&a);
   lv_anim_set_var(&a, agentAttentionRing);
@@ -2741,7 +2775,8 @@ struct SyncResult {
   int agentAttentionCount;
   bool buzzerEnabled;
   uint32_t attentionRenagMinutes; // T89 — settings.attentionRenagMinutes; 0 = re-nag off
-  bool agentDoneChime;            // T87 — a session crossed working->done this poll
+  bool agentDoneChime;            // T87/T99 — a tracked session crossed working->done/idle this poll
+  bool agentPollOk;              // T99 #3 — agent-sessions GET+parse succeeded this poll (independent of the pcState GET / result.ok)
   // T76 — see PC_RECENT_INPUT_WINDOW_S's own comment. Not "preserved unless
   // a real value arrives" like volumeFuseMs/idleToHomeMs above: absence
   // should read as "no recent PC input known," not "keep believing
@@ -2779,20 +2814,54 @@ bool syncGet(const char *host, String &body) {
 constexpr uint32_t AGENT_SESSIONS_POLL_INTERVAL_MS = 3000;
 uint32_t lastAgentSessionsPollMs = 0;
 
-bool agentSessionsGet(const char *host, String &body) {
+// T99 #1 (2026-09-03) — per-session status tracking for the completion chime.
+// The aggregate-only trigger this replaces (T87/T95) could not fire while any
+// *other* session stayed `working` (e.g. an always-on coordinator session), so
+// an individual session finishing produced no chime even though the phone
+// (per-session, T93) beeped. Now any tracked session going working -> done/idle
+// sets result.agentDoneChime. Fixed array — the many-concurrent-sessions case
+// is rare on one desk; overflow just means a late-added session isn't tracked
+// for its finish edge (no crash, no spurious chime).
+struct AgentSessionSlot {
+  char id[40]; // sessionId is a 36-char UUID
+  AgentStatus status;
+};
+AgentSessionSlot agentSessionSlots[16] = {};
+
+// T99 #5 (2026-09-03) — GET + parse the session list, streaming the body
+// straight into ArduinoJson instead of buffering it in a String first
+// (removes a latent truncation/heap failure mode on larger session lists).
+// Falls back to getString() only if Content-Length is absent (chunked). Also
+// records dbg* for /debug/agent. Returns true on GET+parse success.
+bool agentSessionsFetch(const char *host, JsonDocument &doc) {
   HTTPClient http;
   String url = String("http://") + host + ":" + SYNC_PORT + "/api/agent-sessions";
   http.begin(url);
   http.setConnectTimeout(SYNC_HTTP_TIMEOUT_MS);
   http.setTimeout(SYNC_HTTP_TIMEOUT_MS);
   int httpCode = http.GET();
+  dbgAgentGetCode = httpCode;
   if (httpCode != HTTP_CODE_OK) {
     Serial.printf("agentSessions: GET %s failed, code=%d\n", host, httpCode);
     http.end();
     return false;
   }
-  body = http.getString();
+  int contentLen = http.getSize();
+  DeserializationError err;
+  if (contentLen > 0) {
+    dbgAgentBodyLen = (size_t)contentLen;
+    err = deserializeJson(doc, http.getStream());
+  } else {
+    String body = http.getString(); // chunked / unknown-length fallback
+    dbgAgentBodyLen = body.length();
+    err = deserializeJson(doc, body);
+  }
   http.end();
+  snprintf(dbgAgentParseErr, sizeof(dbgAgentParseErr), "%s", err.c_str());
+  if (err) {
+    Serial.printf("agentSessions: JSON parse failed: %s\n", err.c_str());
+    return false;
+  }
   return true;
 }
 
@@ -2804,44 +2873,56 @@ bool agentSessionsGet(const char *host, String &body) {
 // global values) on any failure, so a transient miss doesn't blank the
 // badge — same "preserved unless real value" shape as volumeFuseMs etc.
 void pollAgentSessions(SyncResult &result) {
-  String body;
-  if (!agentSessionsGet(SYNC_HOST, body) && !agentSessionsGet(SYNC_FALLBACK_IP, body)) {
-    return;
-  }
   JsonDocument doc;
-  DeserializationError err = deserializeJson(doc, body);
-  if (err) {
-    Serial.printf("agentSessions: JSON parse failed: %s\n", err.c_str());
+  if (!agentSessionsFetch(SYNC_HOST, doc) && !agentSessionsFetch(SYNC_FALLBACK_IP, doc)) {
     return;
   }
+  result.agentPollOk = true; // T99 #3 — a real, current agent-sessions snapshot landed
   JsonArray sessions = doc.as<JsonArray>(); // response body is a bare array, confirmed via T61's smoke test (200 [])
   AgentStatus worst = AGENT_STATUS_NONE;
   int attentionCount = 0;
   int activeCount = 0;
-  // T87 (2026-09-02): the hub's `done` snapshot lingers ~15 polls after
-  // stoppedAt (AGENT_SESSION_DONE_DECAY_SECONDS) before it recomputes to
-  // "idle" server-side — so dedupe the completion chime on the distinct
-  // `stoppedAt` ISO string (pc-dash-hub blessed this over a per-session
-  // last-status map). Small ring buffer covers the unlikely case of several
-  // sessions finishing inside the same decay window.
-  static String recentDoneChimed[5];
-  static uint8_t recentDoneIdx = 0;
+  bool slotSeen[16] = {false};
+  String sessList; // T99 instrumentation — "project:status,..." for /debug/agent
   for (JsonObject s : sessions) {
     const char *statusStr = s["status"] | "";
-    if (!strcmp(statusStr, "done")) {
-      const char *stoppedAt = s["stoppedAt"] | "";
-      if (stoppedAt[0]) {
-        bool seen = false;
-        for (int i = 0; i < 5; i++) {
-          if (recentDoneChimed[i] == stoppedAt) { seen = true; break; }
-        }
-        if (!seen) {
+    AgentStatus st = agentStatusFromString(statusStr);
+
+    if (sessList.length() < 200) {
+      if (sessList.length()) sessList += ",";
+      sessList += (const char *)(s["project"] | "?");
+      sessList += ":";
+      sessList += statusStr[0] ? statusStr : "?";
+    }
+
+    // T99 #1 — per-session finish-edge tracking. Runs for every session,
+    // including `done` ones, so a working -> done transition is caught before
+    // the aggregate `continue` below skips done/none sessions.
+    const char *sid = s["sessionId"] | "";
+    if (sid[0]) {
+      int slot = -1;
+      for (int i = 0; i < 16; i++) {
+        if (agentSessionSlots[i].id[0] && !strcmp(agentSessionSlots[i].id, sid)) { slot = i; break; }
+      }
+      if (slot >= 0) {
+        if (agentSessionSlots[slot].status == AGENT_STATUS_WORKING &&
+            (st == AGENT_STATUS_DONE || st == AGENT_STATUS_IDLE)) {
           result.agentDoneChime = true;
-          recentDoneChimed[recentDoneIdx] = stoppedAt;
-          recentDoneIdx = (recentDoneIdx + 1) % 5;
+        }
+        agentSessionSlots[slot].status = st;
+        slotSeen[slot] = true;
+      } else {
+        for (int i = 0; i < 16; i++) {
+          if (!agentSessionSlots[i].id[0]) { // first sighting — record, no chime
+            snprintf(agentSessionSlots[i].id, sizeof(agentSessionSlots[i].id), "%s", sid);
+            agentSessionSlots[i].status = st;
+            slotSeen[i] = true;
+            break;
+          }
         }
       }
     }
+
     // T83 (2026-09-01, Brian's correction): deliberately does NOT skip
     // `stale` sessions anymore (used to: `if (s["stale"] | false)
     // continue;`). The hub's 120s stale timeout meant a needs-input/error
@@ -2853,14 +2934,20 @@ void pollAgentSessions(SyncResult &result) {
     // SessionEnd leaves the ring/buzzer stuck lit with no auto-recovery —
     // Brian prefers that over this silent false-clear. Applies to both T60's
     // buzz/badge and T77's ring, since they share this function's output.
-    AgentStatus st = agentStatusFromString(statusStr);
     if (st == AGENT_STATUS_DONE || st == AGENT_STATUS_NONE) continue; // finished/unrecognized sessions don't hold the ring (T87: `done` is transient-terminal, not active)
     activeCount++;
     if (st == AGENT_STATUS_NEEDS_INPUT || st == AGENT_STATUS_ERROR) attentionCount++;
     if (agentStatusPriority(st) > agentStatusPriority(worst)) worst = st;
   }
+  // T99 #1 — a slot not seen in this snapshot means the session was removed
+  // (SessionEnd -> DELETE); free it so its id can be reused and it can't
+  // spuriously match a future session.
+  for (int i = 0; i < 16; i++) {
+    if (!slotSeen[i]) agentSessionSlots[i].id[0] = 0;
+  }
   result.agentAggregateStatus = (activeCount > 0) ? worst : AGENT_STATUS_NONE;
   result.agentAttentionCount = attentionCount;
+  snprintf(dbgAgentSessions, sizeof(dbgAgentSessions), "%s", sessList.c_str());
 }
 
 // T48 (2026-08-26): utcOffsetMinutes now free-runs between syncs instead of
@@ -2926,7 +3013,8 @@ bool pollSyncState() {
   result.agentAttentionCount = agentAttentionCount;
   result.buzzerEnabled = buzzerEnabled;
   result.attentionRenagMinutes = attentionRenagMinutes; // T89 — preserved unless the settings blob carries a new value
-  result.agentDoneChime = false; // T87 — event flag, only set true by pollAgentSessions() on a real working->done edge
+  result.agentDoneChime = false; // T87/T99 — event flag, only set true by pollAgentSessions() on a real per-session working->done/idle edge
+  result.agentPollOk = false;    // T99 #3 — set true only on a successful agent-sessions GET+parse
 
   if (WiFi.status() == WL_CONNECTED) {
     String body;
@@ -3412,12 +3500,19 @@ void setupHttpOta() {
   });
   webServer.on("/debug/agent", HTTP_GET, [](AsyncWebServerRequest *request) {
     if (!request->authenticate("ota", OTA_PASSWORD)) return request->requestAuthentication();
-    char body[256];
+    char body[640];
+    uint32_t feedAgeMs = millis() - lastAgentPollOkMs;
     snprintf(body, sizeof(body),
              "agentAggregateStatus=%d agentAttentionCount=%d buzzerEnabled=%d buzzPlaying=%d "
-             "attentionRenagMinutes=%u lastAttentionChimeMs=%u pcConnected=%d millis=%u\n",
+             "attentionRenagMinutes=%u lastAttentionChimeMs=%u pcConnected=%d millis=%u\n"
+             "ring: rendered=%d (0=hidden 1=working 2=attention) feedAgeMs=%u feedStaleMs=%u\n"
+             "agentGet: code=%d bodyLen=%u parseErr=%s\n"
+             "sessions: %s\n",
              (int)agentAggregateStatus, agentAttentionCount, buzzerEnabled ? 1 : 0, buzzPlaying ? 1 : 0,
-             attentionRenagMinutes, lastAttentionChimeMs, pcConnected ? 1 : 0, (unsigned)millis());
+             attentionRenagMinutes, lastAttentionChimeMs, pcConnected ? 1 : 0, (unsigned)millis(),
+             agentRingRendered, (unsigned)feedAgeMs, (unsigned)AGENT_FEED_STALE_MS,
+             dbgAgentGetCode, (unsigned)dbgAgentBodyLen, dbgAgentParseErr,
+             dbgAgentSessions[0] ? dbgAgentSessions : "(none captured yet)");
     request->send(200, "text/plain", body);
   });
   Serial.println("Debug buzzer/agent readouts ready at /debug/buzz and /debug/agent");
@@ -3509,8 +3604,11 @@ void loop() {
     xSemaphoreGive(syncResultMutex);
 
     lastSyncPollOk = result.ok;
+    // T99 #3 — hoisted: the agent-apply block below runs independently of
+    // result.ok (the pcState GET's success), so it needs the pre-update
+    // pcConnected value too, for T91's offline-edge check.
+    bool wasPcConnected = pcConnected;
     if (result.ok) {
-      bool wasPcConnected = pcConnected;
       pcConnected = result.pcConnected;
       lastInputSecondsAgo = result.lastInputSecondsAgo; // T76
       lastSeenSecondsAgo = result.lastSeenSecondsAgo;
@@ -3526,71 +3624,10 @@ void loop() {
       buzzerEnabled = result.buzzerEnabled;
       attentionRenagMinutes = result.attentionRenagMinutes; // T89
 
-      // T60 (agent-monitor mode): independent of pcConnected — agent
-      // sessions come from pc-dash-app's hook forwarder (T58), a separate
-      // signal from the Core Audio/SMTC readback pcConnected tracks, even
-      // though they typically run on the same physical PC. Badge always
-      // reflects the latest aggregate; flash+buzz fire only on the edge
-      // into an attention state (needs-input/error), not on every poll that
-      // happens to still be in one.
-      bool wasAttention = (agentAggregateStatus == AGENT_STATUS_NEEDS_INPUT || agentAggregateStatus == AGENT_STATUS_ERROR);
-      bool wasWorking = (agentAggregateStatus == AGENT_STATUS_WORKING);
-      bool agentStatusChanged = (agentAggregateStatus != result.agentAggregateStatus);
-      agentAggregateStatus = result.agentAggregateStatus;
-      agentAttentionCount = result.agentAttentionCount;
-      // T91 (2026-09-02): PC just went offline — clear the attention ring and
-      // silence any repeating attention chime. updateAgentAttentionRing() now
-      // hides the ring whenever !pcConnected; the buzzer is stopped outright
-      // so a mid-pattern chime doesn't keep going after the PC is gone.
-      if (wasPcConnected && !pcConnected) {
-        stopBuzzPattern();
-        // T92 (2026-09-02): PC offline -> drop the knob straight into sleep
-        // mode now, rather than waiting out the full dimDelayMs of no local
-        // interaction. Backdating the local interaction clock lets the
-        // existing idle-state machine in loop() do the actual transition
-        // (idleScreen + DISPLAY_BRIGHTNESS_IDLE) and, importantly, its normal
-        // wake path still works: a real rotation/touch/press resets
-        // lastAnyInteractionMs and wakes as usual. pcRecentlyActive is
-        // already false while offline, so nothing fights this.
-        uint32_t nowMs = millis();
-        lastAnyInteractionMs = (nowMs > dimDelayMs) ? (nowMs - dimDelayMs) : 0;
-      }
-      if (agentStatusChanged || pcConnected != wasPcConnected) {
-        updateAgentStatusBadge();
-        updateAgentAttentionRing(); // T77/T90/T91 — cheap to restart redundantly
-        Serial.printf("agentStatus: newAgg=%d wasWorking=%d wasAttention=%d pcConnected %d->%d doneFlag=%d\n",
-                      (int)result.agentAggregateStatus, wasWorking, wasAttention, wasPcConnected, pcConnected, result.agentDoneChime);
-        WebSerial.printf("agentStatus: newAgg=%d wasWorking=%d wasAttention=%d pcConnected %d->%d doneFlag=%d\n",
-                         (int)result.agentAggregateStatus, wasWorking, wasAttention, wasPcConnected, pcConnected, result.agentDoneChime);
-      }
-      bool isAttention = (agentAggregateStatus == AGENT_STATUS_NEEDS_INPUT || agentAggregateStatus == AGENT_STATUS_ERROR);
-      bool isWorking = (agentAggregateStatus == AGENT_STATUS_WORKING);
-      // T95 (2026-09-02): the completion chime originally fired only on an
-      // explicit `status:"done"` (T87). On real hardware Brian's Claude Code
-      // sessions emit `working`->`idle` on the Stop hook (agent finished a
-      // turn) and only `working`->`done` on SessionEnd (terminal closed) —
-      // so the common "work finished, come look" moment produced no chime.
-      // Broadened: fire once whenever the aggregate leaves `working` for any
-      // non-attention state (idle / none / done), OR on an explicit `done`.
-      // Flagged to the coordinator to confirm this matches intent.
-      bool workFinished = (wasWorking && !isWorking && !isAttention) ||
-                          (!isAttention && result.agentDoneChime);
-      if (!wasAttention && isAttention) {
-        // T90: entry chime + flash on crossing into needs-input/error. The
-        // re-nag block further down in loop() repeats the chime every
-        // attentionRenagMinutes from this anchor until the state resolves.
-        triggerAgentFlash(agentStatusColor(agentAggregateStatus));
-        startAttentionChime();
-        lastAttentionChimeMs = millis();
-        Serial.printf("agentChime: ENTRY status=%d buzzerEnabled=%d\n", (int)agentAggregateStatus, buzzerEnabled);
-        WebSerial.printf("agentChime: ENTRY status=%d buzzerEnabled=%d\n", (int)agentAggregateStatus, buzzerEnabled);
-      } else if (workFinished) {
-        startBuzzPattern(BUZZ_PATTERN_DONE, sizeof(BUZZ_PATTERN_DONE) / sizeof(BUZZ_PATTERN_DONE[0]));
-        Serial.printf("agentChime: DONE wasWorking=%d doneFlag=%d newStatus=%d buzzerEnabled=%d\n",
-                      wasWorking, result.agentDoneChime, (int)agentAggregateStatus, buzzerEnabled);
-        WebSerial.printf("agentChime: DONE wasWorking=%d doneFlag=%d newStatus=%d buzzerEnabled=%d\n",
-                         wasWorking, result.agentDoneChime, (int)agentAggregateStatus, buzzerEnabled);
-      }
+      // T99 #3: agent-status handling moved out of this result.ok block — see
+      // the `if (result.agentPollOk)` block right after it. The agent-sessions
+      // poll succeeds or fails independently of the pcState GET, so its
+      // results must be applied even on a pcState miss.
 
       // Volume/mute/now-playing: only trust the payload once the companion
       // app has actually reported in on *this* poll (result.pcConnected) —
@@ -3680,6 +3717,70 @@ void loop() {
         updateNowPlayingScreen();
       }
     }
+
+    // T60/T99 agent-monitor apply — runs whenever a fresh agent-sessions
+    // snapshot landed (result.agentPollOk), INDEPENDENT of result.ok (#3): the
+    // agent feed is pc-dash-app's hook forwarder (T58), a separate signal and
+    // a separate request from the pcState GET, so a pcState miss must not
+    // freeze agent status. Badge/ring reflect the latest aggregate; the
+    // completion chime is per-session (#1); the attention chime fires on the
+    // aggregate's edge into needs-input/error.
+    if (result.agentPollOk) {
+      lastAgentPollOkMs = millis(); // T99 #2 — feeds updateAgentAttentionRing()'s freshness gate
+      bool wasAttention = (agentAggregateStatus == AGENT_STATUS_NEEDS_INPUT || agentAggregateStatus == AGENT_STATUS_ERROR);
+      bool agentStatusChanged = (agentAggregateStatus != result.agentAggregateStatus);
+      agentAggregateStatus = result.agentAggregateStatus;
+      agentAttentionCount = result.agentAttentionCount;
+      // T91 (2026-09-02): PC just went offline — silence any repeating
+      // attention chime and drop to sleep (T92). The red attention ring is
+      // hidden by updateAgentAttentionRing()'s own !pcConnected gate; the
+      // orange working ring is NOT pcConnected-gated (T99 #2) but its own
+      // freshness gate takes it down once the forwarder stops reporting.
+      if (wasPcConnected && !pcConnected) {
+        stopBuzzPattern();
+        uint32_t nowMs = millis();
+        lastAnyInteractionMs = (nowMs > dimDelayMs) ? (nowMs - dimDelayMs) : 0;
+      }
+      if (agentStatusChanged || pcConnected != wasPcConnected) {
+        updateAgentStatusBadge();
+        updateAgentAttentionRing();
+        Serial.printf("agentStatus: newAgg=%d wasAttention=%d pcConnected %d->%d doneFlag=%d pcStateOk=%d\n",
+                      (int)agentAggregateStatus, wasAttention, wasPcConnected, pcConnected, result.agentDoneChime, result.ok);
+        WebSerial.printf("agentStatus: newAgg=%d wasAttention=%d pcConnected %d->%d doneFlag=%d pcStateOk=%d\n",
+                         (int)agentAggregateStatus, wasAttention, wasPcConnected, pcConnected, result.agentDoneChime, result.ok);
+      }
+      bool isAttention = (agentAggregateStatus == AGENT_STATUS_NEEDS_INPUT || agentAggregateStatus == AGENT_STATUS_ERROR);
+      // T99 #1: completion chime is now driven purely by the per-session
+      // working->done/idle edge detected in pollAgentSessions() — fires even
+      // while other sessions (an always-on coordinator) stay working, which
+      // the old aggregate-transition trigger structurally could not.
+      // Suppressed while the aggregate needs a human, so a finish never steps
+      // on an active needs-input chime.
+      bool workFinished = (!isAttention && result.agentDoneChime);
+      if (!wasAttention && isAttention) {
+        triggerAgentFlash(agentStatusColor(agentAggregateStatus));
+        startAttentionChime();
+        lastAttentionChimeMs = millis();
+        Serial.printf("agentChime: ENTRY status=%d buzzerEnabled=%d\n", (int)agentAggregateStatus, buzzerEnabled);
+        WebSerial.printf("agentChime: ENTRY status=%d buzzerEnabled=%d\n", (int)agentAggregateStatus, buzzerEnabled);
+      } else if (workFinished) {
+        startBuzzPattern(BUZZ_PATTERN_DONE, sizeof(BUZZ_PATTERN_DONE) / sizeof(BUZZ_PATTERN_DONE[0]));
+        Serial.printf("agentChime: DONE (per-session) newStatus=%d buzzerEnabled=%d\n", (int)agentAggregateStatus, buzzerEnabled);
+        WebSerial.printf("agentChime: DONE (per-session) newStatus=%d buzzerEnabled=%d\n", (int)agentAggregateStatus, buzzerEnabled);
+      }
+    }
+  }
+
+  // T99 #7 (2026-09-03): re-assert the attention/working ring on a fixed
+  // cadence, not only on a sync-apply edge. A WORKING aggregate that settled
+  // during a gap where the edge check didn't fire — or a feed that has just
+  // gone stale (AGENT_FEED_STALE_MS) — still needs the ring to catch up.
+  // updateAgentAttentionRing() is idempotent (its agentRingRendered guard), so
+  // calling it on every eligible pass is free when nothing has changed.
+  static uint32_t lastRingRefreshMs = 0;
+  if (millis() - lastRingRefreshMs >= 1000) {
+    lastRingRefreshMs = millis();
+    updateAgentAttentionRing();
   }
 
   // T29 (2026-08-21): advance the displayed elapsed time by one real second
