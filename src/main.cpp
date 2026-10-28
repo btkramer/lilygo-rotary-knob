@@ -25,6 +25,7 @@
 #include "hid_media.h"
 #include "input.h"
 #include "display.h"
+#include "debug_console.h"
 #include "main_decls.h"
 
 // Custom-generated font (src/lv_font_montserrat_64_custom.c) — see that
@@ -34,41 +35,6 @@ extern const lv_font_t lv_font_montserrat_64_custom;
 
 constexpr uint32_t DEBOUNCE_MS = 30;
 constexpr uint32_t WIFI_CONNECT_TIMEOUT_MS = 10000;
-
-// Reset-reason diagnostic (2026-08-25) — added while investigating the
-// recurring "OTA/espota wedged, needs a physical power cycle" pattern
-// (T18/T25/T26, recurred again on T40's own flash attempt). Leading theory:
-// a marginal/shared power supply browning out under OTA's own current spikes
-// (flash writes draw noticeably more current, worsened by this board's
-// PSRAM-in-OPI-mode + always-on display + WiFi all sharing one supply; a
-// reboot's WiFi-reconnect immediately afterward draws its own separate
-// spike) — corroborated by Brian's own observation that another device
-// sharing the same USB hub was also visibly power-starved (charging very
-// slowly). Captured once at boot, read from setup() before anything else
-// runs and printed both immediately (Serial, for a USB-serial-connected
-// session) and on every periodic status line (Serial+WebSerial, since this
-// board normally has no serial access once deployed — see HARDWARE.md's
-// "Debugging without serial access" note). If this ever reads
-// ESP_RST_BROWNOUT right after a future wedge, that's a direct confirmation
-// instead of a theory; consistently reading something else (e.g. ESP_RST_SW,
-// meaning a normal ESP.restart()) would argue against this theory instead.
-esp_reset_reason_t bootResetReason;
-
-const char *resetReasonStr(esp_reset_reason_t reason) {
-  switch (reason) {
-    case ESP_RST_POWERON:   return "POWERON";
-    case ESP_RST_EXT:       return "EXT_PIN";
-    case ESP_RST_SW:        return "SW (ESP.restart())";
-    case ESP_RST_PANIC:     return "PANIC";
-    case ESP_RST_INT_WDT:   return "INT_WDT";
-    case ESP_RST_TASK_WDT:  return "TASK_WDT";
-    case ESP_RST_WDT:       return "OTHER_WDT";
-    case ESP_RST_DEEPSLEEP: return "DEEPSLEEP_WAKE";
-    case ESP_RST_BROWNOUT:  return "BROWNOUT";
-    case ESP_RST_SDIO:      return "SDIO";
-    default:                return "UNKNOWN";
-  }
-}
 
 // Placeholder values until the companion app protocol exists (see
 // PROGRESS.md's "Next" list) — proving the LVGL screen rendering works on
@@ -198,34 +164,6 @@ constexpr uint32_t RING_COLOR_WORKING = 0xFF8C00;  // orange (matches cpuArc)
 constexpr uint32_t RING_COLOR_ATTENTION = 0xFF3B30; // red (matches AGENT_STATUS_ERROR)
 constexpr uint32_t AGENT_FEED_STALE_MS = 9000;      // T99 — 3x AGENT_SESSIONS_POLL_INTERVAL_MS; working ring hides if the feed is older
 
-// Buzzer (T60) — plain tone()/noTone() on PIN_BUZZER (17, confirmed in
-// pin_config.h). HARDWARE.md also notes a vibration motor on this board,
-// "unused so far" — deliberately NOT wired here too: its GPIO isn't
-// documented anywhere this project has confirmed on real hardware (only the
-// buzzer pin made it into pin_config.h), and this project's own hard-won
-// rule is not to guess hardware pins (see arduino/CLAUDE.md's ACL saga for
-// an unrelated example of the same "verify, don't guess" norm). Flagged as
-// an open question in coordinator-reports/pc-dash.md rather than guessed.
-//
-// Non-blocking: loop() must never block (ArduinoOTA.handle() only gets
-// serviced when loop() reaches it — see the sync section's own comment on
-// why that matters). serviceBuzzer(), called every loop() pass, steps
-// through a short on/off pattern purely by comparing millis() against a
-// deadline — same "never delay(), always millis()-gated" shape as every
-// other timed effect in this file (e.g. showVolumeOverlay's fuse).
-struct BuzzStep { uint16_t freqHz; uint16_t onMs; uint16_t offMs; };
-// Passive magnetic buzzer on IO17 — its acoustic output falls off steeply
-// away from mechanical resonance, so both tiers are driven at one tuned
-// frequency rather than the old 2200/1100 Hz split (the 1100 Hz "error" tone
-// in particular was well down the response curve and barely audible).
-// LilyGo's own factory firmware drives this exact buzzer at 2000 Hz, so
-// that's the starting point; refine it with the temporary `buzzsweep`
-// WebSerial command (see setupWebSerial()) and fold the loudest value back
-// into BUZZ_FREQ_HZ. Tiers stay distinguishable by *rhythm* — two short
-// beeps vs. three longer ones — not pitch, per ECOSYSTEM_PLAN.md's
-// "distinct patterns per notification tier" ask.
-constexpr uint16_t BUZZ_FREQ_HZ = 2000;
-constexpr BuzzStep BUZZ_PATTERN_NEEDS_INPUT[] = {{BUZZ_FREQ_HZ, 120, 90}, {BUZZ_FREQ_HZ, 120, 90}};
 constexpr BuzzStep BUZZ_PATTERN_ERROR[] = {{BUZZ_FREQ_HZ, 180, 120}, {BUZZ_FREQ_HZ, 180, 120}, {BUZZ_FREQ_HZ, 180, 120}};
 // T87/T99 (2026-09-03) — two-tier completion chime, both values Brian
 // approved by ear via the T98 WebSerial audition bench (`snd complete` /
@@ -310,13 +248,6 @@ void startAttentionChime() {
                            : sizeof(BUZZ_PATTERN_NEEDS_INPUT) / sizeof(BUZZ_PATTERN_NEEDS_INPUT[0]));
 }
 
-// T98 (2026-09-02) — TEMP WebSerial buzzer-pattern audition bench. Lets Brian
-// try candidate beep rhythms by ear (via `snd ...` in WebSerial, see
-// setupWebSerial()) before the beep vocabulary is locked. Deliberately ignores
-// buzzerEnabled — it's a manual test trigger, not a real notification. Strip
-// this helper, the `sndTestSteps` buffer, and the `snd ...` command block once
-// the beep vocab is finalized (same category as `buzzsweep`/`/debug/buzz`).
-constexpr size_t SND_TEST_MAX_STEPS = 16;
 BuzzStep sndTestSteps[SND_TEST_MAX_STEPS];
 void playSndTest(const BuzzStep *src, size_t len) {
   if (len == 0 || len > SND_TEST_MAX_STEPS || buzzSweepActive) return;
@@ -2941,97 +2872,6 @@ void setupTimeSync() {
   if (WiFi.status() != WL_CONNECTED) return;
   configTzTime("UTC0", "pool.ntp.org", "time.nist.gov");
   Serial.println("Time sync started (SNTP, UTC)");
-}
-
-// Debug console over WiFi (http://<device-ip>/webserial) — added 2026-08-07
-// so runtime logging doesn't need a USB cable, same reasoning as OTA: once
-// this board lives permanently on Brian's desktop, this session has no
-// physical/serial access to it at all (see PROGRESS.md's quick-jump/swipe
-// session for how much that hurt debugging touch behavior earlier).
-// Needs WiFi already up, so only called from setup() after setupOTA() — same
-// "no WiFi, no OTA" graceful-degradation shape as that function.
-AsyncWebServer webServer(80);
-
-void setupWebSerial() {
-  if (WiFi.status() != WL_CONNECTED) return; // no WiFi, no WebSerial — same as OTA
-  WebSerial.begin(&webServer);
-  WebSerial.onMessage([](const String &msg) {
-    Serial.printf("WebSerial recv: %s\n", msg.c_str());
-    String m = msg;
-    m.trim();
-    if (m == "buzzsweep") {
-      startBuzzSweep();
-    } else if (m == "buzz") {
-      startBuzzPattern(BUZZ_PATTERN_NEEDS_INPUT,
-                       sizeof(BUZZ_PATTERN_NEEDS_INPUT) / sizeof(BUZZ_PATTERN_NEEDS_INPUT[0]));
-    } else if (m.startsWith("buzz ")) {
-      long f = m.substring(5).toInt();
-      if (f >= 100 && f <= 10000) {
-        buzzSpotTest((uint16_t)f);
-      } else {
-        WebSerial.println("buzz: freq must be 100-10000 Hz");
-      }
-    } else if (m.startsWith("snd ")) {
-      // T98 (2026-09-02) — TEMP beep-vocab audition bench. Strip with the rest
-      // of the buzzer test instrumentation once the vocabulary is locked.
-      String a = m.substring(4);
-      a.trim();
-      if (a == "complete") {
-        BuzzStep s[] = {{BUZZ_FREQ_HZ, 70, 60}, {BUZZ_FREQ_HZ, 70, 0}};
-        playSndTest(s, 2);
-        WebSerial.println("snd: complete  70/60/70");
-      } else if (a == "needsinput") {
-        BuzzStep s[] = {{BUZZ_FREQ_HZ, 160, 110}, {BUZZ_FREQ_HZ, 160, 0}};
-        playSndTest(s, 2);
-        WebSerial.println("snd: needsinput  160/110/160");
-      } else if (a == "error") {
-        BuzzStep s[] = {{BUZZ_FREQ_HZ, 90, 70}, {BUZZ_FREQ_HZ, 90, 70},
-                        {BUZZ_FREQ_HZ, 90, 70}, {BUZZ_FREQ_HZ, 90, 0}};
-        playSndTest(s, 4);
-        WebSerial.println("snd: error  90/70 x4");
-      } else if (a == "renag") {
-        BuzzStep s[] = {{BUZZ_FREQ_HZ, 160, 0}};
-        playSndTest(s, 1);
-        WebSerial.println("snd: renag  160");
-      } else if (a.startsWith("raw ")) {
-        String list = a.substring(4);
-        long vals[SND_TEST_MAX_STEPS * 2];
-        int n = 0;
-        int start = 0;
-        while (start <= (int)list.length() && n < (int)(SND_TEST_MAX_STEPS * 2)) {
-          int comma = list.indexOf(',', start);
-          String tok = (comma < 0) ? list.substring(start) : list.substring(start, comma);
-          tok.trim();
-          if (tok.length() > 0) {
-            long v = tok.toInt();
-            if (v < 0) v = 0;
-            if (v > 5000) v = 5000;
-            vals[n++] = v;
-          }
-          if (comma < 0) break;
-          start = comma + 1;
-        }
-        if (n == 0) {
-          WebSerial.println("snd raw: need a comma list of ms, e.g. snd raw 70,60,70");
-        } else {
-          size_t steps = (n + 1) / 2;
-          if (steps > SND_TEST_MAX_STEPS) steps = SND_TEST_MAX_STEPS;
-          BuzzStep s[SND_TEST_MAX_STEPS];
-          for (size_t i = 0; i < steps; i++) {
-            s[i].freqHz = BUZZ_FREQ_HZ;
-            s[i].onMs = (uint16_t)vals[2 * i];
-            s[i].offMs = (2 * i + 1 < n) ? (uint16_t)vals[2 * i + 1] : 0;
-          }
-          playSndTest(s, steps);
-          WebSerial.printf("snd raw: %d step(s)\n", (int)steps);
-        }
-      } else {
-        WebSerial.println("snd: complete | needsinput | error | renag | raw <ms,ms,...>");
-      }
-    }
-  });
-  webServer.begin();
-  Serial.println("WebSerial ready at /webserial");
 }
 
 // HTTP-based OTA (added 2026-08-21) — a single-connection POST upload,
