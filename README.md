@@ -4,6 +4,10 @@ Firmware for a desktop rotary-knob controller built on the **LilyGo T-Encoder Pr
 2" AMOLED touchscreen inside a rotary encoder. It controls PC volume and media natively over
 USB, shows what's playing, and glows when a Claude Code session needs your attention.
 
+![Knob screens: Home, Now Playing and Light, with the agent-working ring](docs/images/screenshot.png)
+
+<sub>Screens from the interactive v2 design prototype; the orange ring means a Claude Code session is working.</sub>
+
 Part of the **PC Dash** family:
 
 | Repo | Role |
