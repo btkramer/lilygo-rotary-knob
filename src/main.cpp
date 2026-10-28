@@ -22,6 +22,7 @@
 #include "USBHIDConsumerControl.h"
 #include "secrets.h"
 #include "pin_config.h"
+#include "hid_media.h"
 
 // Custom-generated font (src/lv_font_montserrat_64_custom.c) — see that
 // file's header comment for why. Not one of LVGL's own bundled sizes, so
@@ -30,8 +31,6 @@ extern const lv_font_t lv_font_montserrat_64_custom;
 
 constexpr uint32_t DEBOUNCE_MS = 30;
 constexpr uint32_t WIFI_CONNECT_TIMEOUT_MS = 10000;
-
-USBHIDConsumerControl ConsumerControl;
 
 // Encoder reading moved from loop()-polling to a hardware interrupt
 // (2026-08-07) — polling missed/misread transitions on fast spins (Brian:
