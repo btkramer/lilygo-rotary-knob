@@ -1,5 +1,11 @@
 # PC Dash Knob
 
+![ESP32-S3](https://img.shields.io/badge/ESP32--S3-E7352C?logo=espressif&logoColor=white)
+![PlatformIO](https://img.shields.io/badge/PlatformIO-F5822A?logo=platformio&logoColor=white)
+![LVGL 9](https://img.shields.io/badge/LVGL-9.2-343839)
+![USB HID](https://img.shields.io/badge/USB-HID-555)
+![Claude Code](https://img.shields.io/badge/Claude%20Code-agent%20monitor-D97757)
+
 Firmware for a desktop rotary-knob controller built on the **LilyGo T-Encoder Pro**: a round
 2" AMOLED touchscreen inside a rotary encoder. It controls PC volume and media natively over
 USB, shows what's playing, and glows when a Claude Code session needs your attention.
@@ -15,6 +21,30 @@ Part of the **PC Dash** family:
 | **lilygo-rotary-knob** (this repo) | The knob: ESP32-S3 firmware |
 | [pc-dash-hub](https://github.com/btkramer/pc-dash-hub) | Self-hosted hub (FastAPI + Docker) that relays state, settings and smart-home actions |
 | [pc-dash-app](https://github.com/btkramer/pc-dash-app) | Windows companion app that reports real PC audio, media and agent state |
+
+## Design directions
+
+The v2 screens were explored in an interactive prototype with eight visual directions. Each
+one has its own type, palette and layout for Home, Now Playing and Light:
+
+![Six of the design directions: Analog, Typeset, Segment LCD, Dot matrix, Stripes, Terminal](docs/images/directions.png)
+
+![Quick-jump menu, system detail, Do Not Disturb, and Now Playing in the Orbit direction](docs/images/menus.png)
+
+<sub>Top: Analog, Typeset, Segment LCD, Dot matrix, Stripes, Terminal. Bottom: Quick-jump, System detail, Do Not Disturb, Now Playing (Orbit).</sub>
+
+## The PC Dash system
+
+```mermaid
+flowchart LR
+  KNOB["Knob<br/>(ESP32-S3)"] -- "USB HID<br/>volume, media" --> PC["Windows PC"]
+  APP["pc-dash-app<br/>(.NET 8)"] -- "audio, media,<br/>agent sessions" --> HUB["pc-dash-hub<br/>(FastAPI, Docker)"]
+  PC --- APP
+  KNOB <-- "Wi-Fi: state,<br/>settings" --> HUB
+  DECK["Phone deck<br/>(browser)"] <--> HUB
+  HUB -- "lights, scenes" --> HA["Home Assistant"]
+  CC["Claude Code hooks"] --> APP
+```
 
 ## Features
 
