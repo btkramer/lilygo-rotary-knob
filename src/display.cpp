@@ -4,7 +4,6 @@
 #include <Arduino_GFX_Library.h>
 #include <lvgl.h>
 #include "pin_config.h"
-#include "main_decls.h"
 #include "input.h"
 #include "display.h"
 #include "agent_status.h"
@@ -14,6 +13,7 @@
 #include "screen_volume.h"
 #include "screen_mute.h"
 #include "screen_now_playing.h"
+#include "screen_quick_jump.h"
 
 // Display bring-up only at this stage — proving the panel actually lights up
 // and responds correctly before building any real UI on top of it. Pin
