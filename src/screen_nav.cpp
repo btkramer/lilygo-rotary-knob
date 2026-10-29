@@ -7,6 +7,7 @@
 #include "input.h"
 #include "screen_nav.h"
 #include "screen_volume.h"
+#include "screen_now_playing.h"
 
 lv_obj_t *homeScreen;
 lv_obj_t *volumeScreen;

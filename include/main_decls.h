@@ -4,7 +4,5 @@
 #include <Arduino.h>
 #include <lvgl.h>
 
-void buildNowPlayingScreen(lv_obj_t *scr);
-void showNowPlayingScreen();
 void buildQuickJumpScreen(lv_obj_t *scr);
 void showQuickJumpMenu();

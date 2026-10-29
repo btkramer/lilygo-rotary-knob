@@ -13,6 +13,7 @@
 #include "screen_idle.h"
 #include "screen_volume.h"
 #include "screen_mute.h"
+#include "screen_now_playing.h"
 
 // Display bring-up only at this stage — proving the panel actually lights up
 // and responds correctly before building any real UI on top of it. Pin
