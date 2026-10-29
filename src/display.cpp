@@ -8,6 +8,7 @@
 #include "input.h"
 #include "display.h"
 #include "agent_status.h"
+#include "screen_nav.h"
 
 // Display bring-up only at this stage — proving the panel actually lights up
 // and responds correctly before building any real UI on top of it. Pin
