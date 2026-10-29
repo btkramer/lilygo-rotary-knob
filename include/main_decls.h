@@ -4,7 +4,6 @@
 #include <Arduino.h>
 #include <lvgl.h>
 
-void buildHomeScreen(lv_obj_t *scr);
 extern lv_obj_t *idleScreen;
 void buildIdleScreen(lv_obj_t *scr);
 extern uint32_t lastVolumeActivityMs;
