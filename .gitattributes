@@ -1,0 +1,4 @@
+# Generated LVGL font and image C files: kept out of GitHub's language stats and
+# collapsed in diffs.
+src/lv_font_*.c linguist-generated=true
+src/img_*.c linguist-generated=true
