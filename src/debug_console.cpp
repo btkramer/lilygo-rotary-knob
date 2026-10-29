@@ -6,8 +6,8 @@
 #include <ESPAsyncWebServer.h>
 #include <WebSerial.h>
 #include "esp_system.h" // reset-reason diagnostic, see bootResetReason's own comment
-#include "main_decls.h"
 #include "debug_console.h"
+#include "buzzer.h"
 
 // Reset-reason diagnostic (2026-08-25) — added while investigating the
 // recurring "OTA/espota wedged, needs a physical power cycle" pattern
