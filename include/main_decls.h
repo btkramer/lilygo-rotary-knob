@@ -48,8 +48,6 @@ constexpr size_t SND_TEST_MAX_STEPS = 16;
 void playSndTest(const BuzzStep *src, size_t len);
 void startBuzzSweep();
 void buzzSpotTest(uint16_t freqHz);
-extern lv_obj_t *agentAttentionRing;
-void updateAgentAttentionRing();
 void buildHomeScreen(lv_obj_t *scr);
 extern lv_obj_t *idleScreen;
 void buildIdleScreen(lv_obj_t *scr);
