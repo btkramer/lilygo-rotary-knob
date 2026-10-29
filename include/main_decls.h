@@ -4,8 +4,6 @@
 #include <Arduino.h>
 #include <lvgl.h>
 
-extern lv_obj_t *idleScreen;
-void buildIdleScreen(lv_obj_t *scr);
 extern uint32_t lastVolumeActivityMs;
 extern uint32_t lastSpeakerMuteActivityMs;
 extern uint32_t lastQuickJumpActivityMs;
