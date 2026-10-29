@@ -4,10 +4,6 @@
 #include <Arduino.h>
 #include <lvgl.h>
 
-extern uint32_t lastVolumeActivityMs;
-extern uint32_t lastSpeakerMuteActivityMs;
-extern uint32_t lastQuickJumpActivityMs;
-void buildVolumeScreen(lv_obj_t *scr);
 void buildSpeakerMuteScreen(lv_obj_t *scr);
 void buildNowPlayingScreen(lv_obj_t *scr);
 void showNowPlayingScreen();
