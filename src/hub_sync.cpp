@@ -5,7 +5,6 @@
 #include <HTTPClient.h>
 #include <ArduinoJson.h>
 #include "secrets.h"
-#include "main_decls.h"
 #include "pc_state.h"
 #include "agent_status.h"
 #include "buzzer.h"
@@ -14,6 +13,7 @@
 #include "screen_volume.h"
 #include "screen_now_playing.h"
 #include "hub_sync.h"
+#include "settings_store.h"
 
 // Docker app sync protocol (pc-dash-hub) — see ECOSYSTEM_PLAN.md's "Docker
 // app sync protocol" section for the full design. Firmware polls one
